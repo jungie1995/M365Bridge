@@ -4044,6 +4044,7 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice,
 // one canonical simulation message. The full history remains present exactly
 // once inside requestJSON, avoiding duplicated context at the M365 layer.
 func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
+	requestJSON = responsesPromptWithoutImageBytes(requestJSON)
 	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice, evidence)
 	canonical := payload.Message{Role: "user", Content: prompt}
 	for _, message := range *messages {
@@ -4051,6 +4052,48 @@ func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, to
 		canonical.Annotations = append(canonical.Annotations, message.Annotations...)
 	}
 	*messages = []payload.Message{canonical}
+}
+
+// Images travel through the upload/annotation path, not through the textual
+// tool-simulation envelope. Keep a position marker in history for each image.
+func responsesPromptWithoutImageBytes(requestJSON string) string {
+	var request any
+	if json.Unmarshal([]byte(requestJSON), &request) != nil {
+		return requestJSON
+	}
+	index := 0
+	var visit func(any)
+	visit = func(value any) {
+		switch node := value.(type) {
+		case map[string]any:
+			kind, _ := node["type"].(string)
+			if kind == "input_image" || kind == "image_url" || kind == "image" {
+				index++
+				for key := range node {
+					delete(node, key)
+				}
+				node["type"] = "input_text"
+				node["text"] = fmt.Sprintf("[Image attachment %d is supplied separately for visual inspection.]", index)
+				return
+			}
+			for _, child := range node {
+				visit(child)
+			}
+		case []any:
+			for _, child := range node {
+				visit(child)
+			}
+		}
+	}
+	visit(request)
+	if index == 0 {
+		return requestJSON
+	}
+	result, err := json.Marshal(request)
+	if err != nil {
+		return requestJSON
+	}
+	return string(result)
 }
 
 // injectSimulatedPromptAnthropic replaces the last user message with a
@@ -5632,8 +5675,34 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// responsesInputToMessages converts the Responses API input field (string or
-// array of input items) to a slice of payload.Message.
+// responsesToolOutputMessage preserves text, call identity and image attachments.
+func responsesToolOutputMessage(item map[string]any) payload.Message {
+	callID, _ := item["call_id"].(string)
+	output, isText := item["output"].(string)
+	var result payload.Message
+	if _, isBlocks := item["output"].([]any); isBlocks {
+		// Codex's view_image returns typed output blocks. Decode them using
+		// the normal multimodal path instead of serializing image bytes into
+		// the text prompt (which can exceed the upstream WebSocket limit).
+		encoded, _ := json.Marshal(map[string]any{"role": "tool", "content": item["output"]})
+		if json.Unmarshal(encoded, &result) == nil {
+			output = result.Content
+			if len(result.Images) > 0 {
+				output += "\n[Tool result includes image attachments.]"
+			}
+		}
+	} else if !isText && item["output"] != nil {
+		encoded, _ := json.Marshal(item["output"])
+		output = string(encoded)
+	}
+	result.Role = "tool"
+	result.Content = fmt.Sprintf("Authoritative tool result (call_id: %s):\n%s", callID, output)
+	result.ToolCallID = callID
+	result.ToolResults = []payload.ToolResultRecord{{ID: callID, Content: output}}
+	return result
+}
+
+// responsesInputToMessages converts the Responses API input field to messages.
 func responsesInputToMessages(input any) []payload.Message {
 	if input == nil {
 		return []payload.Message{{Role: "user", Content: ""}}
@@ -5666,18 +5735,7 @@ func responsesInputToMessages(input any) []payload.Message {
 		// reports its result the same way, only under its own item type and
 		// with the free-form field name.
 		if itemType == "custom_tool_call_output" {
-			callID, _ := m["call_id"].(string)
-			output, _ := m["output"].(string)
-			messages = append(messages, payload.Message{
-				Role: "tool",
-				Content: fmt.Sprintf(
-					"Authoritative tool result (call_id: %s):\n%s",
-					callID,
-					output,
-				),
-				ToolCallID:  callID,
-				ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
-			})
+			messages = append(messages, responsesToolOutputMessage(m))
 			continue
 		}
 
@@ -5719,22 +5777,7 @@ func responsesInputToMessages(input any) []payload.Message {
 		}
 
 		if itemType == "function_call_output" {
-			callID, _ := m["call_id"].(string)
-			output, _ := m["output"].(string)
-			if output == "" && m["output"] != nil {
-				encoded, _ := json.Marshal(m["output"])
-				output = string(encoded)
-			}
-			messages = append(messages, payload.Message{
-				Role: "tool",
-				Content: fmt.Sprintf(
-					"Authoritative tool result (call_id: %s):\n%s",
-					callID,
-					output,
-				),
-				ToolCallID:  callID,
-				ToolResults: []payload.ToolResultRecord{{ID: callID, Content: output}},
-			})
+			messages = append(messages, responsesToolOutputMessage(m))
 			continue
 		}
 

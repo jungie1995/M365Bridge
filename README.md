@@ -340,6 +340,29 @@ curl http://localhost:8230/v1/chat/completions \
 
 Use the port your installation listens on: `8230` for the Docker setup above, or whatever you passed to `--port`. Open the same address in a browser to reach the interface.
 
+### Browser reconnect on Windows
+
+An existing configured installation can renew its Microsoft credentials through
+a dedicated Edge sign-in window:
+
+```powershell
+.\m365-bridge.exe login-browser
+```
+
+Run this from the installation directory containing `data/`. Sign in normally to
+the Microsoft account already configured in the bridge and complete MFA when
+requested. The helper validates OAuth state, PKCE, and the returned account before
+saving credentials. It uses its own Edge profile under
+`%LOCALAPPDATA%\M365Bridge\BrowserSignIn`, which can remember the session for later
+connections. No DevTools token export is required for reconnecting.
+
+The helper stores renewed credentials using the existing token/cookie stores and
+preserves `data/.env`. Status is available in `data/browser-login-status.json`;
+that file contains no tokens or cookie values. Use `--timeout 10m` for a longer
+sign-in window (the default is five minutes). The browser window closes after a
+successful connection. This reconnects Microsoft authentication; the local API
+key used by clients is configured separately.
+
 ### Keeping the connection alive
 
 Microsoft issues single-page-application refresh tokens with a **24-hour** lifetime. What happens next depends on what you collected:
@@ -1212,6 +1235,24 @@ No credential is sent on that download, so any public https host is accepted. Th
 Anthropic `image` blocks carry base64 data directly and are unaffected.
 
 ## Image generation
+
+For accounts using the newer OwaHub request route, this fork provides an opt-in
+browser-compatible image profile. Use `M365_BROWSER_IMAGE_ROUTING=1` in the image
+worker's process environment and request `model="auto"`. A separate image worker
+can run on another port while the existing coding endpoint retains its settings:
+
+```powershell
+$env:M365_BROWSER_IMAGE_ROUTING = "1"
+.\m365-bridge.exe serve --port 8001
+```
+
+This reproduces the routing and image options of a working Microsoft 365 browser
+session; valid Microsoft account access is still required. It defaults off.
+
+Responses API image-bearing tool results, including Codex `view_image` results,
+are uploaded as image attachments. Their binary data is replaced by position
+markers in the text-only tool-simulation envelope, avoiding oversized text
+requests while retaining the actual images for visual inspection.
 
 An image can also come out of an ordinary chat turn. Asking for one in `/v1/chat/completions`, `/v1/messages`, `/v1/completions` or `/v1/responses` puts a markdown image link in the answer, and the image stays part of the conversation, so the next turn can ask for a change to it.
 

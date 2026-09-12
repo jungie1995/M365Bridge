@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,8 +12,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/browserlogin"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/servers"
@@ -59,6 +62,9 @@ func main() {
 		case "setup-wizard":
 			runSetupWizard(os.Args[2:])
 			return
+		case "login-browser":
+			runBrowserLogin(os.Args[2:])
+			return
 		}
 	}
 
@@ -87,6 +93,7 @@ USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
+  m365-bridge login-browser [flags]     Reconnect using a dedicated Edge sign-in window
   m365-bridge --help                    Print this text
 
   Every flag is optional. With none, serve listens on port %d and setup-wizard
@@ -107,6 +114,10 @@ SERVE FLAGS
 SETUP-WIZARD FLAGS
   -file <path>      Setup JSON with oid, tenant and refresh_token (default %q)
 
+BROWSER SIGN-IN FLAGS
+  -timeout <duration>   Sign-in window timeout (default 5m, maximum 10m)
+  -status-file <path>   Non-secret progress file (default data/browser-login-status.json)
+
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
 	printEnvironment(w)
@@ -118,6 +129,7 @@ EXAMPLES
   m365-bridge serve --port 8000
   m365-bridge --list-models
   m365-bridge setup-wizard
+  m365-bridge login-browser
 `)
 }
 
@@ -151,6 +163,8 @@ func printEnvironment(w io.Writer) {
                                    accepted wherever a key is.
 
   Answers
+    M365_BROWSER_IMAGE_ROUTING    Set to 1 for the opt-in OwaHub image request
+                                   profile (default off). Prefer a separate image worker.
     M365_ENABLE_WEB_SEARCH         Let Copilot search the web (default true).
     M365_MAX_TOOL_ROUNDS           Tool rounds one turn may drive before the
                                    request is refused (default %d, ceiling %d).
@@ -252,6 +266,26 @@ func runSetupWizard(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runBrowserLogin reconnects the existing Microsoft account through Edge.
+func runBrowserLogin(args []string) {
+	fs := flag.NewFlagSet("login-browser", flag.ExitOnError)
+	timeout := fs.Duration("timeout", 5*time.Minute, "Browser sign-in timeout")
+	statusFile := fs.String("status-file", "data/browser-login-status.json", "Non-secret progress file")
+	attempt := fs.String("attempt-id", fmt.Sprint(time.Now().UnixNano()), "Progress correlation identifier")
+	_ = fs.Parse(args)
+	if *timeout < time.Second || *timeout > 10*time.Minute {
+		fmt.Fprintln(os.Stderr, "Browser sign-in timeout must be between 1s and 10m.")
+		os.Exit(1)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := browserlogin.Run(ctx, models.LoadConfig(), browserlogin.Options{StatusFile: *statusFile, Timeout: *timeout, AttemptID: *attempt}); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	fmt.Println("Microsoft account connected. Credentials were saved locally; no browser export is required.")
 }
 
 // runCLI runs the default CLI mode (single query or interactive).

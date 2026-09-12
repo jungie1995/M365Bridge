@@ -5,6 +5,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -208,7 +209,7 @@ func (tm *TokenManager) M365CookieHeader() (string, error) {
 	var cookieParts []string
 	for _, cookie := range store.Cookies {
 		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
-		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
+		if domain != "m365.cloud.microsoft" && domain != "cloud.microsoft" && domain != "microsoft.com" {
 			continue
 		}
 		if cookie.Name == "" || cookie.Value == "" {
@@ -345,7 +346,9 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 		redirectReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
 		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		redirectReq.Header.Set("Cookie", cookieHeader)
+		if redirectReq.URL.Scheme == "https" && redirectReq.URL.Hostname() == "login.microsoftonline.com" {
+			redirectReq.Header.Set("Cookie", cookieHeader)
+		}
 
 		_ = currentResp.Body.Close()
 		currentResp, err = client.Do(redirectReq)
@@ -425,8 +428,14 @@ func summarizeBrokerAuthorizeResponse(body string) string {
 	return textcut.Truncate(compactBody, 300)
 }
 
-// exchangeAuthCode exchanges an authorization code for access and refresh tokens.
-func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, error) {
+// authCodeTokens holds a token-endpoint response until it is validated and saved.
+type authCodeTokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+}
+
+func (tm *TokenManager) requestAuthCode(ctx context.Context, authCode, verifier string) (authCodeTokens, error) {
 	tokenData := url.Values{
 		"client_id":     {tm.clientID},
 		"grant_type":    {"authorization_code"},
@@ -436,9 +445,9 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, err
 		"scope":         {tm.scope + " offline_access"},
 	}
 
-	tokenReq, err := http.NewRequest("POST", tm.tokenURL, strings.NewReader(tokenData.Encode()))
+	tokenReq, err := http.NewRequestWithContext(ctx, "POST", tm.tokenURL, strings.NewReader(tokenData.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to create token request: %v", ErrRefreshFailed, err)
+		return authCodeTokens{}, fmt.Errorf("%w: failed to create token request: %v", ErrRefreshFailed, err)
 	}
 	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
 	tokenReq.Header.Set("Origin", "https://m365.cloud.microsoft")
@@ -449,30 +458,34 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, err
 	client := &http.Client{Timeout: 15 * time.Second}
 	tokenResp, err := client.Do(tokenReq)
 	if err != nil {
-		return "", fmt.Errorf("%w: token exchange failed: %v", ErrRefreshFailed, err)
+		return authCodeTokens{}, fmt.Errorf("%w: token exchange failed: %v", ErrRefreshFailed, err)
 	}
 	defer func() { _ = tokenResp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(tokenResp.Body, tokenResponseMax+1))
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to read token response: %v", ErrRefreshFailed, err)
+		return authCodeTokens{}, fmt.Errorf("%w: failed to read token response: %v", ErrRefreshFailed, err)
 	}
 	if len(body) > tokenResponseMax {
-		return "", fmt.Errorf("%w: token response exceeds %d bytes", ErrRefreshFailed, tokenResponseMax)
+		return authCodeTokens{}, fmt.Errorf("%w: token response exceeds %d bytes", ErrRefreshFailed, tokenResponseMax)
 	}
 
 	if tokenResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%w: token exchange status %d: %s", ErrRefreshFailed, tokenResp.StatusCode, string(body))
+		return authCodeTokens{}, fmt.Errorf("%w: token exchange status %d (%s)", ErrRefreshFailed, tokenResp.StatusCode, aadstsCode(string(body)))
 	}
 
-	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
+	var result authCodeTokens
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("%w: failed to parse token response: %v", ErrRefreshFailed, err)
+		return authCodeTokens{}, fmt.Errorf("%w: failed to parse token response: %v", ErrRefreshFailed, err)
+	}
+	return result, nil
+}
+
+func (tm *TokenManager) exchangeAuthCode(authCode, verifier string) (string, error) {
+	result, err := tm.requestAuthCode(context.Background(), authCode, verifier)
+	if err != nil {
+		return "", err
 	}
 
 	// Save new refresh token if provided

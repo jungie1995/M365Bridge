@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -100,7 +101,7 @@ func TestTranscriptReplaceWritesAPrivateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0600 {
 		t.Errorf("file mode = %o, want 600", perm)
 	}
 }

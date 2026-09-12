@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -97,7 +98,7 @@ func TestSaveM365CookiesEncryptsStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat M365 cookie store: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("M365 cookie store mode = %o, want 600", info.Mode().Perm())
 	}
 

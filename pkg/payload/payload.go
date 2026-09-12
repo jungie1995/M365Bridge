@@ -391,6 +391,9 @@ func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, 
 	uuidSID := formatUUID(hexSID)
 
 	baseURL := fmt.Sprintf("wss://substrate.office.com/m365Copilot/Chathub/%s@%s", userOID, tenantID)
+	if os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1" {
+		baseURL = fmt.Sprintf("wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub/%s@%s", userOID, tenantID)
+	}
 	url := fmt.Sprintf("%s?chatsessionid=%s&XRoutingParameterSessionKey=%s&clientrequestid=%s&X-SessionId=%s",
 		baseURL, hexSID, hexSID, hexSID, uuidSID)
 
@@ -399,9 +402,18 @@ func BuildURL(token, hexSID, conversationID, userOID, tenantID string) (string, 
 	}
 
 	url += fmt.Sprintf("&access_token=%s", token)
-	url += fmt.Sprintf("&variants=%s", variants)
-	url += "&source=%22officeweb%22&product=Office&agentHost=Bizchat.FullScreen"
-	url += "&licenseType=Starter&isEdu=true&agent=web&scenario=OfficeWebIncludedCopilot"
+	requestVariants := variants
+	if os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1" {
+		requestVariants = browserImageVariants
+	}
+	url += fmt.Sprintf("&variants=%s", requestVariants)
+	if os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1" {
+		url += "&source=%22owahub%22&product=OwaHub&agentHost=Bizchat.FullScreen"
+		url += "&licenseType=Starter&isEdu=false&agent=work&scenario=owahub"
+	} else {
+		url += "&source=%22officeweb%22&product=Office&agentHost=Bizchat.FullScreen"
+		url += "&licenseType=Starter&isEdu=true&agent=web&scenario=OfficeWebIncludedCopilot"
+	}
 
 	return url, hexSID, uuidSID, nil
 }
@@ -594,6 +606,24 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, includ
 		},
 	}
 
+	if os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1" && !hasTools {
+		args := payload["arguments"].([]map[string]any)[0]
+		args["source"] = "owahub"
+		args["optionsSets"] = browserImageOptions
+		args["allowedMessageTypes"] = append(append([]string{}, allowedMessageTypes...), "GenerateGraphicArt", "TriggerUserInputRequest", "EscapeHatch", "TriggerPluginAuth", "ResumePluginAuth", "ReferencesListComplete", "SwitchRespondingEndpoint")
+		args["requestId"] = hexSID
+		args["traceId"] = hexSID
+		args["threadLevelGptId"] = map[string]any{}
+		info := map[string]any{"clientPlatform": "OwaHub-web", "clientAppName": "OwaHub", "clientEntrypoint": "owahub", "clientSessionId": uuidSID, "ProductCategory": "Chat", "clientAppType": "Web", "productEntryPoint": "ChatPanel", "deviceOS": "Windows", "deviceType": "Desktop", "clientPlatformVersion": "10"}
+		args["clientInfo"] = info
+		message := buildMinimalMessage(hexSID, lastText, annotations)
+		message["entityAnnotationTypes"] = []string{"People", "File", "Event", "Email", "TeamsMessage"}
+		message["requestId"] = hexSID
+		message["clientInfo"] = info
+		message["clientPreferences"] = map[string]any{"executionControls": map[string]any{"web": map[string]any{}, "work": map[string]any{}}}
+		args["message"] = message
+		args["gpts"] = []map[string]any{{"id": "bizchat-as-gpt-scenario", "source": "BuiltInAgents", "clientOverrides": map[string]any{"capabilities": []map[string]string{{"name": "WebSearch"}, {"name": "WorkSearch"}}, "deepResearchModels@odata.type": "Collection(String)"}}}
+	}
 	if gptOverride != "" {
 		args := payload["arguments"].([]map[string]any)
 		args[0]["gptIdOverride"] = map[string]string{
@@ -608,6 +638,28 @@ func BuildConversationPayload(hexSID, uuidSID string, messages []Message, includ
 	}
 	return string(data), nil
 }
+
+// Opt-in diagnostic profile captured from a successful OwaHub image request.
+// It is never enabled implicitly for existing installations.
+var browserImageOptions = []string{
+	"at_mention_plugins_enable", "enable_confirmation_interstitial", "enable_plugin_auth_interstitial",
+	"enable_request_response_interstitials", "enable_response_action_processing", "enterprise_flux_image",
+	"enterprise_flux_web", "enterprise_flux_work", "enterprise_toolbox_with_skdsstore", "enterprise_pagination_support",
+	"search_result_progress_messages_with_search_queries", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+	"rich_responses", "gptvnorm2048", "enterprise_flux_work_code_interpreter", "cwc_code_interpreter_citation_fix",
+	"code_interpreter_interactive_charts", "enterprise_code_interpreter_citation_fix", "cwc_code_interpreter_interactive_charts_inline_image",
+	"code_interpreter_matplotlib_patching", "enable_batch_token_processing", "disable_cea_message_listener",
+	"enable_selective_url_redaction", "update_memory_plugin", "add_custom_instructions", "agent_recommendations",
+	"enable_gg_gpt", "async_client_interaction", "enable_inferred_memory_read", "update_textdoc_response_after_streaming",
+	"deepleo_networking_timeout_10minutes_canmore", "flux_v3_references", "flux_v3_references_entities", "flux_v3_references_ci",
+	"add_filestore_filetype", "cwc_code_interpreter_citation_sourceannotations", "cwc_flux_v3", "cwc_code_interpreter",
+	"cdxcwc_code_interpreter_hallucinated_url_filter", "flux_v3_image_gen_enable_dimensions",
+	"flux_v3_image_gen_enable_non_watermarked_storage", "flux_v3_image_gen_enable_icon_dimensions",
+	"flux_v3_image_gen_enable_system_text_with_params", "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+	"flux_v3_image_gen_enable_story",
+}
+
+const browserImageVariants = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableImageGenInsufficientTokensThrottled,feature.EnableImageGenSystemCapacityThrottled,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.turnOnWorkTabRecommendation,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,feature.IsCitationsReferencesOutputEnabled,feature.enableDeltaStreamingForReferences,feature.enableIncludeReferencesInDeltaResponse,feature.enablereferencesforagents,feature.EnableCodeInterpreterConversion,agt_module_attr_enableReferencesForCodeInterpreter,agt_module_enableCodeInterpreterHallucinatedUrlFilter,agt_module_attr_enableCodeInterpreterFilePreviewReference,cdxcipreviewmsg,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,SingletonEnvOn,EnableComposeWidget,agt_researcheragent_enableMemoryRead,feature.EnableMergingPureDeltas,feature.isExternalEmailEnabled,feature.isExcludedEmailEnabled,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.EnableConversationShareApis,feature.EnableConversationShareApisForMsa,feature.EnableGoodbyeDrainGate,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableContentApiandDocTypeHtmlInRichAnswers,cdxgrounding_api_v2_rich_web_answers_reference_bottom_force,cdxenablerenderforisocomp,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.EnableSkipRehydrationForSpeCIdImages,feature.sourcescontrolmainline,feature.sourcescontrolmainlineal,feature.EnableConnectorExecutionControlsAllowlist,feature.EnableBizchatMainlineExecutionControlsResolution,cdxentrecapvifluxv3,rich_responses,feature.EnableBase64DataInMessageAnnotations,feature.EnableStarterLicenseCheckBypass,feature.DisableMimir3sFlow,feature.EnablePersonalWorkingSetFor3s,feature.EnableSkipEmittingMessageOnFlush,feature.EnableRemoveEmptySourceAttributions,feature.EnableRemoveStreamingMode,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix"
 
 // buildFullMessage constructs a full message object for single-message requests.
 // Uses the full entityAnnotationTypes and connectedFederatedConnections.
