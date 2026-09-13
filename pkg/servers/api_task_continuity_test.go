@@ -168,18 +168,7 @@ func TestProgressFailuresAreErrorsOnEveryWireFormat(t *testing.T) {
 	for _, failure := range []error{toolcalling.ErrTaskIncomplete, toolcalling.ErrToolLoopStalled} {
 		for _, format := range []string{"json", "chat-sse", "completions-sse", "anthropic-sse", "responses-sse"} {
 			rec := httptest.NewRecorder()
-			switch format {
-			case "json":
-				api.sendUpstreamError(rec, "tool execution", failure)
-			case "chat-sse":
-				api.sendSSEError(rec, "tool execution", "turn", "model", failure)
-			case "completions-sse":
-				api.sendSSEError(rec, "tool execution", "turn", "model", failure, "text_completion")
-			case "anthropic-sse":
-				api.sendAnthropicProgressError(rec, failure)
-			case "responses-sse":
-				writeResponsesServerError(rec, true, "turn", 1, "model", failure.Error(), upstreamErrorMessage("tool execution", failure.Error()))
-			}
+			writeProgressTestError(api, rec, format, failure)
 			body := rec.Body.String()
 			if !strings.Contains(body, failure.Error()) || strings.Contains(body, `"finish_reason":"stop"`) || strings.Contains(body, `"type":"response.completed"`) {
 				t.Fatalf("%s concealed a failure as completion: %s", format, body)
@@ -188,6 +177,21 @@ func TestProgressFailuresAreErrorsOnEveryWireFormat(t *testing.T) {
 				t.Fatalf("status=%d, want actionable conflict", rec.Code)
 			}
 		}
+	}
+}
+
+func writeProgressTestError(api *APIServer, rec *httptest.ResponseRecorder, format string, failure error) {
+	switch format {
+	case "json":
+		api.sendUpstreamError(rec, "tool execution", failure)
+	case "chat-sse":
+		api.sendSSEError(rec, "tool execution", "turn", "model", failure)
+	case "completions-sse":
+		api.sendSSEError(rec, "tool execution", "turn", "model", failure, "text_completion")
+	case "anthropic-sse":
+		api.sendAnthropicProgressError(rec, failure)
+	case "responses-sse":
+		writeResponsesServerError(rec, true, "turn", 1, "model", failure.Error(), upstreamErrorMessage("tool execution", failure.Error()))
 	}
 }
 

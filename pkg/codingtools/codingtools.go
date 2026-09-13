@@ -96,69 +96,105 @@ func (m *Manager) Tools() []Tool {
 
 // Execute invokes one named tool with JSON-compatible arguments.
 func (m *Manager) Execute(ctx context.Context, name string, arguments map[string]any) Result {
-	result := Result{Tool: name}
 	if !m.config.Enabled {
-		result.Error = "coding tools are disabled"
+		return Result{Tool: name, Error: "coding tools are disabled"}
+	}
+	if result, handled := m.executeCommandTool(ctx, name, arguments); handled {
 		return result
 	}
-	var output string
-	var truncated bool
-	var err error
+	output, truncated, err := m.executeTextTool(ctx, name, arguments)
+	return textResult(name, output, truncated, err)
+}
+
+// executeCommandTool runs the tools that shell out. handled is false when the
+// name belongs to a tool that produces text instead.
+func (m *Manager) executeCommandTool(ctx context.Context, name string, arguments map[string]any) (Result, bool) {
+	switch name {
+	case "shell_command":
+		return m.shellCommandTool(ctx, name, arguments), true
+	case "git_status":
+		return m.command(ctx, name, []string{"git", "status", "--short"}, nil), true
+	case "git_diff":
+		return m.gitDiffTool(ctx, name, arguments), true
+	case "git_log":
+		return m.gitLogTool(ctx, name, arguments), true
+	case "run_tests":
+		return m.runTestsTool(ctx, name, arguments), true
+	}
+	return Result{}, false
+}
+
+// executeTextTool runs the tools that produce text. An unknown name lands here,
+// because every command tool was already matched by executeCommandTool.
+func (m *Manager) executeTextTool(ctx context.Context, name string, arguments map[string]any) (string, bool, error) {
 	switch name {
 	case "list_files":
-		output, truncated, err = m.listFiles(arguments)
+		return m.listFiles(arguments)
 	case "read_file":
-		output, truncated, err = m.readFile(arguments)
+		return m.readFile(arguments)
 	case "write_file":
-		output, err = m.writeFile(arguments)
+		output, err := m.writeFile(arguments)
+		return output, false, err
 	case "search_files":
-		output, truncated, err = m.searchFiles(arguments)
-	case "shell_command":
-		command, argErr := stringArg(arguments, "command", true)
-		if argErr != nil {
-			err = argErr
-		} else {
-			return m.command(ctx, name, command, nil)
-		}
-	case "git_status":
-		return m.command(ctx, name, []string{"git", "status", "--short"}, nil)
-	case "git_diff":
-		args := []string{"git", "diff"}
-		if booleanArg(arguments, "staged") {
-			args = append(args, "--staged")
-		}
-		return m.command(ctx, name, args, nil)
-	case "git_log":
-		limit, argErr := intArg(arguments, "limit", 10, 1, 100)
-		if argErr != nil {
-			err = argErr
-		} else {
-			return m.command(ctx, name, []string{"git", "log", "--oneline", fmt.Sprintf("-%d", limit)}, nil)
-		}
-	case "run_tests":
-		command, argErr := stringArg(arguments, "command", false)
-		if argErr != nil {
-			err = argErr
-		} else {
-			if command == "" {
-				command = "go test ./..."
-			}
-			return m.command(ctx, name, command, nil)
-		}
+		return m.searchFiles(arguments)
 	case "apply_patch":
-		output, truncated, err = m.applyPatch(ctx, arguments)
-	default:
-		err = fmt.Errorf("unknown tool %q", name)
+		return m.applyPatch(ctx, arguments)
 	}
-	result.Output, result.Truncated = output, truncated
-	result.Success = err == nil
+	return "", false, fmt.Errorf("unknown tool %q", name)
+}
+
+// textResult shapes the answer of a tool that produced text rather than running
+// a process, and of a command tool that never got as far as running one.
+func textResult(name, output string, truncated bool, err error) Result {
+	result := Result{Tool: name, Output: output, Truncated: truncated, Success: err == nil}
 	if err != nil {
 		result.Error = err.Error()
 	}
 	return result
 }
 
-func (m *Manager) resolve(path string, create bool) (string, error) {
+// shellCommandTool runs the command line the caller supplied.
+func (m *Manager) shellCommandTool(ctx context.Context, name string, arguments map[string]any) Result {
+	command, err := stringArg(arguments, "command", true)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	return m.command(ctx, name, command, nil)
+}
+
+// gitDiffTool shows the workspace diff, staged when the caller asked for it.
+func (m *Manager) gitDiffTool(ctx context.Context, name string, arguments map[string]any) Result {
+	args := []string{"git", "diff"}
+	if booleanArg(arguments, "staged") {
+		args = append(args, "--staged")
+	}
+	return m.command(ctx, name, args, nil)
+}
+
+// gitLogTool shows the most recent workspace commits.
+func (m *Manager) gitLogTool(ctx context.Context, name string, arguments map[string]any) Result {
+	limit, err := intArg(arguments, "limit", 10, 1, 100)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	return m.command(ctx, name, []string{"git", "log", "--oneline", fmt.Sprintf("-%d", limit)}, nil)
+}
+
+// runTestsTool runs the caller's test command, defaulting to the Go one.
+func (m *Manager) runTestsTool(ctx context.Context, name string, arguments map[string]any) Result {
+	command, err := stringArg(arguments, "command", false)
+	if err != nil {
+		return textResult(name, "", false, err)
+	}
+	if command == "" {
+		command = "go test ./..."
+	}
+	return m.command(ctx, name, command, nil)
+}
+
+// cleanRelativePath refuses an absolute path and a traversal, and normalizes
+// what is left. An empty path names the workspace root.
+func cleanRelativePath(path string) (string, error) {
 	if path == "" {
 		path = "."
 	}
@@ -169,22 +205,44 @@ func (m *Manager) resolve(path string, create bool) (string, error) {
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", errors.New("path traversal is not allowed")
 	}
+	return clean, nil
+}
+
+// existingAncestor walks up from a path that does not exist yet and returns the
+// nearest ancestor that does, because only an existing path can be resolved
+// through its symlinks.
+func existingAncestor(path string) (string, error) {
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return path, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", errors.New("no existing parent")
+		}
+		path = parent
+	}
+}
+
+// resolve turns a caller-supplied path into a workspace path, and refuses one
+// that leaves the workspace or names a protected credential file. With create
+// set the path itself need not exist yet.
+func (m *Manager) resolve(path string, create bool) (string, error) {
+	clean, err := cleanRelativePath(path)
+	if err != nil {
+		return "", err
+	}
 	candidate := filepath.Join(m.workspace, clean)
+
 	check := candidate
 	if create {
-		for {
-			if _, err := os.Lstat(check); err == nil {
-				break
-			} else if !errors.Is(err, fs.ErrNotExist) {
-				return "", err
-			}
-			parent := filepath.Dir(check)
-			if parent == check {
-				return "", errors.New("no existing parent")
-			}
-			check = parent
+		if check, err = existingAncestor(candidate); err != nil {
+			return "", err
 		}
 	}
+
 	canonical, err := filepath.EvalSymlinks(check)
 	if err != nil {
 		return "", err
@@ -220,47 +278,62 @@ func protected(path string) bool {
 	return false
 }
 
+// skipProtected tells a directory walk to leave a protected path alone: a
+// directory is not descended into and a file is not reported.
+func skipProtected(entry fs.DirEntry) error {
+	if entry.IsDir() {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
+// listing accumulates the names one directory walk found.
+type listing struct {
+	manager   *Manager
+	root      string
+	recursive bool
+	names     []string
+}
+
+// visit is the walk callback that records one entry.
+func (l *listing) visit(current string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	if current == l.root {
+		return nil
+	}
+	rel, relErr := filepath.Rel(l.manager.workspace, current)
+	if relErr != nil {
+		return relErr
+	}
+	if protected(rel) {
+		return skipProtected(entry)
+	}
+	if entry.Type()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !l.recursive && entry.IsDir() {
+		l.names = append(l.names, filepath.ToSlash(rel)+"/")
+		return filepath.SkipDir
+	}
+	if !entry.IsDir() {
+		l.names = append(l.names, filepath.ToSlash(rel))
+	}
+	return nil
+}
+
 func (m *Manager) listFiles(a map[string]any) (string, bool, error) {
 	path, err := m.resolve(optionalString(a, "path"), false)
 	if err != nil {
 		return "", false, err
 	}
-	recursive := booleanArg(a, "recursive")
-	var names []string
-	err = filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if current == path {
-			return nil
-		}
-		rel, relErr := filepath.Rel(m.workspace, current)
-		if relErr != nil {
-			return relErr
-		}
-		if protected(rel) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !recursive && entry.IsDir() {
-			names = append(names, filepath.ToSlash(rel)+"/")
-			return filepath.SkipDir
-		}
-		if !entry.IsDir() {
-			names = append(names, filepath.ToSlash(rel))
-		}
-		return nil
-	})
-	if err != nil {
+	walk := &listing{manager: m, root: path, recursive: booleanArg(a, "recursive")}
+	if err := filepath.WalkDir(path, walk.visit); err != nil {
 		return "", false, err
 	}
-	sort.Strings(names)
-	return bound(strings.Join(names, "\n"), m.config.MaxOutput)
+	sort.Strings(walk.names)
+	return bound(strings.Join(walk.names, "\n"), m.config.MaxOutput)
 }
 
 func (m *Manager) readFile(a map[string]any) (string, bool, error) {
@@ -316,6 +389,43 @@ func (m *Manager) writeFile(a map[string]any) (string, error) {
 	return fmt.Sprintf("wrote %d bytes", len(content)), nil
 }
 
+// search accumulates the matching lines one directory walk found.
+type search struct {
+	manager *Manager
+	query   string
+	matches []string
+}
+
+// visit is the walk callback that searches one file.
+func (s *search) visit(path string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	rel, _ := filepath.Rel(s.manager.workspace, path)
+	if protected(rel) {
+		return skipProtected(entry)
+	}
+	if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+		return nil
+	}
+	data, readErr := s.manager.readWalkedFile(path)
+	if readErr != nil || int64(len(data)) > s.manager.config.MaxReadBytes {
+		return nil
+	}
+	s.collectMatches(rel, data)
+	return nil
+}
+
+// collectMatches records every line of one file that contains the query, with
+// its line number.
+func (s *search) collectMatches(rel string, data []byte) {
+	for number, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, s.query) {
+			s.matches = append(s.matches, fmt.Sprintf("%s:%d:%s", filepath.ToSlash(rel), number+1, line))
+		}
+	}
+}
+
 func (m *Manager) searchFiles(a map[string]any) (string, bool, error) {
 	query, err := stringArg(a, "query", true)
 	if err != nil {
@@ -325,36 +435,11 @@ func (m *Manager) searchFiles(a map[string]any) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	var matches []string
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, _ := filepath.Rel(m.workspace, path)
-		if protected(rel) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		data, readErr := m.readWalkedFile(path)
-		if readErr != nil || int64(len(data)) > m.config.MaxReadBytes {
-			return nil
-		}
-		for number, line := range strings.Split(string(data), "\n") {
-			if strings.Contains(line, query) {
-				matches = append(matches, fmt.Sprintf("%s:%d:%s", filepath.ToSlash(rel), number+1, line))
-			}
-		}
-		return nil
-	})
-	if err != nil {
+	walk := &search{manager: m, query: query}
+	if err := filepath.WalkDir(root, walk.visit); err != nil {
 		return "", false, err
 	}
-	return bound(strings.Join(matches, "\n"), m.config.MaxOutput)
+	return bound(strings.Join(walk.matches, "\n"), m.config.MaxOutput)
 }
 
 // readWalkedFile reads a file a directory walk found.
@@ -422,30 +507,36 @@ func (m *Manager) applyPatch(ctx context.Context, a map[string]any) (string, boo
 	return result.Output, result.Truncated, nil
 }
 
-func (m *Manager) command(ctx context.Context, tool string, command any, stdin []byte) Result {
-	result := Result{Tool: tool}
-	timed, cancel := context.WithTimeout(ctx, m.config.Timeout)
-	defer cancel()
-	var cmd *exec.Cmd
+// buildCommand turns a command literal into a process. A string is a command
+// line the caller wrote and runs through the shell; a []string is an argument
+// vector this package built and is executed directly.
+func buildCommand(ctx context.Context, command any) (*exec.Cmd, error) {
 	switch value := command.(type) {
 	case string:
 		if strings.TrimSpace(value) == "" {
-			result.Error = "command is required"
-			return result
+			return nil, errors.New("command is required")
 		}
-		cmd = shellCommand(timed, value)
+		return shellCommand(ctx, value), nil
 	case []string:
 		if len(value) == 0 {
-			result.Error = "command is required"
-			return result
+			return nil, errors.New("command is required")
 		}
 		// Running a command is what this package is for, and it is off unless
 		// M365_ENABLE_CODE_TOOLS turns it on. Every []string form here is built
 		// from literals in Execute, never from caller text.
 		// #nosec G204
-		cmd = exec.CommandContext(timed, value[0], value[1:]...)
-	default:
-		result.Error = "invalid command"
+		return exec.CommandContext(ctx, value[0], value[1:]...), nil
+	}
+	return nil, errors.New("invalid command")
+}
+
+func (m *Manager) command(ctx context.Context, tool string, command any, stdin []byte) Result {
+	result := Result{Tool: tool}
+	timed, cancel := context.WithTimeout(ctx, m.config.Timeout)
+	defer cancel()
+	cmd, buildErr := buildCommand(timed, command)
+	if buildErr != nil {
+		result.Error = buildErr.Error()
 		return result
 	}
 	cmd.Dir = m.workspace

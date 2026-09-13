@@ -55,17 +55,17 @@ func edgeExecutable() (string, error) {
 			return candidate, nil
 		}
 	}
-	return "", errors.New("Microsoft Edge was not found on this computer.")
+	return "", errors.New("could not find Microsoft Edge on this computer")
 }
 
 func debuggerAddress(contents string) (string, error) {
 	lines := strings.Fields(contents)
 	if len(lines) < 2 {
-		return "", errors.New("Browser debugger is not ready.")
+		return "", errors.New("browser debugger is not ready")
 	}
 	port, err := strconv.Atoi(lines[0])
 	if err != nil || port < 1024 || port > 65535 || !strings.HasPrefix(lines[1], "/devtools/browser/") || strings.ContainsAny(lines[1], "?#@") {
-		return "", errors.New("Invalid dedicated-browser control endpoint.")
+		return "", errors.New("invalid dedicated-browser control endpoint")
 	}
 	return fmt.Sprintf("ws://127.0.0.1:%d%s", port, lines[1]), nil
 }
@@ -95,7 +95,7 @@ func (b *browser) send(method string, params any, session string) (int, error) {
 	}
 	_ = b.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := b.conn.WriteJSON(request); err != nil {
-		return 0, errors.New("The dedicated sign-in window is no longer available.")
+		return 0, errors.New("the dedicated sign-in window is no longer available")
 	}
 	return b.nextID, nil
 }
@@ -106,44 +106,58 @@ func (b *browser) read(ctx context.Context) (message, error) {
 	}
 	var event message
 	if err := b.conn.ReadJSON(&event); err != nil {
-		return event, errors.New("Sign-in was interrupted or timed out. Open the sign-in window again.")
+		return event, errors.New("sign-in was interrupted or timed out; open the sign-in window again")
 	}
-	if event.Method == "Fetch.requestPaused" && event.SessionID == b.session {
-		var paused struct {
-			RequestID string `json:"requestId"`
-			Request   struct {
-				URL string `json:"url"`
-			} `json:"request"`
-		}
-		if json.Unmarshal(event.Params, &paused) == nil {
-			if b.challenge.MatchesRedirect(paused.Request.URL) {
-				b.callback = paused.Request.URL
-				// Stop the portal from trying to consume our private PKCE flow.
-				_, _ = b.send("Fetch.failRequest", map[string]any{"requestId": paused.RequestID, "errorReason": "Aborted"}, b.session)
-			} else {
-				_, _ = b.send("Fetch.continueRequest", map[string]any{"requestId": paused.RequestID}, b.session)
-			}
-		}
-	}
-	if event.Method == "Page.frameNavigated" && event.SessionID == b.session && b.callback == "" {
-		var navigation struct {
-			Frame struct {
-				URL      string `json:"url"`
-				Fragment string `json:"urlFragment"`
-			} `json:"frame"`
-		}
-		if json.Unmarshal(event.Params, &navigation) == nil {
-			raw := navigation.Frame.URL
-			if navigation.Frame.Fragment != "" && !strings.Contains(raw, "#") {
-				raw += navigation.Frame.Fragment
-			}
-			if b.challenge.MatchesRedirect(raw) {
-				b.callback = raw
-				_, _ = b.send("Page.stopLoading", map[string]any{}, b.session)
+	if event.SessionID == b.session {
+		switch event.Method {
+		case "Fetch.requestPaused":
+			b.observePaused(event.Params)
+		case "Page.frameNavigated":
+			if b.callback == "" {
+				b.observeNavigation(event.Params)
 			}
 		}
 	}
 	return event, nil
+}
+
+func (b *browser) observePaused(params json.RawMessage) {
+	var paused struct {
+		RequestID string `json:"requestId"`
+		Request   struct {
+			URL string `json:"url"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(params, &paused) != nil {
+		return
+	}
+	if b.challenge.MatchesRedirect(paused.Request.URL) {
+		b.callback = paused.Request.URL
+		// Stop the portal from consuming our private PKCE flow.
+		_, _ = b.send("Fetch.failRequest", map[string]any{"requestId": paused.RequestID, "errorReason": "Aborted"}, b.session)
+	} else {
+		_, _ = b.send("Fetch.continueRequest", map[string]any{"requestId": paused.RequestID}, b.session)
+	}
+}
+
+func (b *browser) observeNavigation(params json.RawMessage) {
+	var navigation struct {
+		Frame struct {
+			URL      string `json:"url"`
+			Fragment string `json:"urlFragment"`
+		} `json:"frame"`
+	}
+	if json.Unmarshal(params, &navigation) != nil {
+		return
+	}
+	raw := navigation.Frame.URL
+	if navigation.Frame.Fragment != "" && !strings.Contains(raw, "#") {
+		raw += navigation.Frame.Fragment
+	}
+	if b.challenge.MatchesRedirect(raw) {
+		b.callback = raw
+		_, _ = b.send("Page.stopLoading", map[string]any{}, b.session)
+	}
 }
 
 func (b *browser) call(ctx context.Context, method string, params any, session string) (json.RawMessage, error) {
@@ -158,7 +172,7 @@ func (b *browser) call(ctx context.Context, method string, params any, session s
 		}
 		if event.ID == id {
 			if len(event.Error) > 0 {
-				return nil, errors.New("Edge could not complete the browser sign-in operation.")
+				return nil, errors.New("could not complete the browser sign-in operation in Edge")
 			}
 			return event.Result, nil
 		}
@@ -171,18 +185,30 @@ func splitCookies(cookies []auth.SSOCookie) (login, portal []auth.SSOCookie) {
 			continue
 		}
 		domain := strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
-		if (domain == "login.microsoftonline.com" || domain == "microsoftonline.com") && (cookie.Name == "ESTSAUTH" || cookie.Name == "ESTSAUTHPERSISTENT") {
+		if loginCookie(domain, cookie.Name) {
 			login = append(login, cookie)
-		} else if domain == "m365.cloud.microsoft" || domain == "cloud.microsoft" || domain == "microsoft.com" {
+		} else if portalCookie(domain) {
 			portal = append(portal, cookie)
 		}
 	}
 	return
 }
 
+func loginCookie(domain, name string) bool {
+	return (domain == "login.microsoftonline.com" || domain == "microsoftonline.com") && (name == "ESTSAUTH" || name == "ESTSAUTHPERSISTENT")
+}
+
+func portalCookie(domain string) bool {
+	switch domain {
+	case "m365.cloud.microsoft", "cloud.microsoft", "microsoft.com":
+		return true
+	}
+	return false
+}
+
 func Run(parent context.Context, config *models.Config, options Options) (result error) {
 	if config.TenantID == "" || config.UserOID == "" {
-		return errors.New("Configure the bridge's Microsoft account once before using browser reconnect.")
+		return errors.New("configure the bridge's Microsoft account once before using browser reconnect")
 	}
 	unlock, err := acquireLoginLock()
 	if err != nil {
@@ -195,36 +221,83 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		}
 	}()
 	if err := writeStatus(options, "starting", "Opening a dedicated Microsoft Edge sign-in window."); err != nil {
-		return errors.New("Could not write browser sign-in status.")
+		return errors.New("could not write browser sign-in status")
 	}
 	if options.Timeout <= 0 {
 		options.Timeout = 5 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(parent, options.Timeout)
 	defer cancel()
-	executable, err := edgeExecutable()
-	if err != nil {
-		return err
-	}
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return errors.New("Could not locate the local browser profile directory.")
-	}
-	profile := filepath.Join(cache, "M365Bridge", "BrowserSignIn")
-	if err := os.MkdirAll(profile, 0700); err != nil {
-		return errors.New("Could not create the dedicated sign-in profile.")
-	}
+	return runSignIn(ctx, config, options)
+}
+
+func runSignIn(ctx context.Context, config *models.Config, options Options) error {
 	tm := auth.NewTokenManager(config.TenantID, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
 	tm.SetUserOID(config.UserOID)
 	challenge, err := tm.BeginBrowserLogin()
 	if err != nil {
 		return err
 	}
+	b, err := startBrowser(ctx, challenge)
+	if err != nil {
+		return err
+	}
+	defer b.conn.Close()
+	defer func() { _, _ = b.send("Browser.close", map[string]any{}, "") }()
+	stopWatching := watchBrowserCancellation(ctx, b.conn)
+	defer stopWatching()
+	if err := b.attachSignIn(ctx); err != nil {
+		return err
+	}
+	if err := b.waitForSignIn(ctx, options); err != nil {
+		return err
+	}
+	login, portal, err := b.portalCookies(ctx, options)
+	if err != nil {
+		return err
+	}
+	if err := tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal); err != nil {
+		return err
+	}
+	_ = writeStatus(options, "connected", "Microsoft account connected. Saved credentials and session cookies are available for automatic renewal.")
+	return nil
+}
+
+func browserProfile() (string, error) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", errors.New("could not locate the local browser profile directory")
+	}
+	profile := filepath.Join(cache, "M365Bridge", "BrowserSignIn")
+	if err := os.MkdirAll(profile, 0700); err != nil {
+		return "", errors.New("could not create the dedicated sign-in profile")
+	}
+	return profile, nil
+}
+
+func startBrowser(ctx context.Context, challenge *auth.BrowserChallenge) (*browser, error) {
+	executable, err := edgeExecutable()
+	if err != nil {
+		return nil, err
+	}
+	profile, err := browserProfile()
+	if err != nil {
+		return nil, err
+	}
 	command := exec.Command(executable, "--user-data-dir="+profile, "--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check", "--new-window", "about:blank")
 	if err := command.Start(); err != nil {
-		return errors.New("Could not open Microsoft Edge.")
+		return nil, errors.New("could not open Microsoft Edge")
 	}
 	go func() { _ = command.Wait() }()
+	conn, err := connectBrowser(ctx, profile)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetReadLimit(4 << 20)
+	return &browser{conn: conn, challenge: challenge}, nil
+}
+
+func connectBrowser(ctx context.Context, profile string) (*websocket.Conn, error) {
 	var conn *websocket.Conn
 	until := time.Now().Add(20 * time.Second)
 	for conn == nil && time.Now().Before(until) && ctx.Err() == nil {
@@ -239,11 +312,13 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		}
 	}
 	if conn == nil {
-		return errors.New("Edge's dedicated sign-in connection was unavailable. Browser policy may prevent this connection.")
+		return nil, errors.New("the dedicated Edge sign-in connection was unavailable; browser policy may prevent this connection")
 	}
-	conn.SetReadLimit(4 << 20)
+	return conn, nil
+}
+
+func watchBrowserCancellation(ctx context.Context, conn *websocket.Conn) func() {
 	watchDone := make(chan struct{})
-	defer close(watchDone)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -251,12 +326,13 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		case <-watchDone:
 		}
 	}()
-	b := &browser{conn: conn, challenge: challenge}
-	defer conn.Close()
-	defer func() { _, _ = b.send("Browser.close", map[string]any{}, "") }()
+	return func() { close(watchDone) }
+}
+
+func (b *browser) signInTarget(ctx context.Context) (string, error) {
 	data, err := b.call(ctx, "Target.getTargets", map[string]any{}, "")
 	if err != nil {
-		return err
+		return "", err
 	}
 	var targets struct {
 		TargetInfos []struct {
@@ -276,7 +352,7 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 	if targetID == "" {
 		data, err = b.call(ctx, "Target.createTarget", map[string]any{"url": "about:blank"}, "")
 		if err != nil {
-			return err
+			return "", err
 		}
 		var target struct {
 			ID string `json:"targetId"`
@@ -284,7 +360,15 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		_ = json.Unmarshal(data, &target)
 		targetID = target.ID
 	}
-	data, err = b.call(ctx, "Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true}, "")
+	return targetID, nil
+}
+
+func (b *browser) attachSignIn(ctx context.Context) error {
+	targetID, err := b.signInTarget(ctx)
+	if err != nil {
+		return err
+	}
+	data, err := b.call(ctx, "Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true}, "")
 	if err != nil {
 		return err
 	}
@@ -299,11 +383,12 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		return err
 	}
 	_, err = b.call(ctx, "Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "https://m365.cloud.microsoft/spalanding*", "requestStage": "Request"}}}, b.session)
-	if err != nil {
-		return err
-	}
+	return err
+}
+
+func (b *browser) waitForSignIn(ctx context.Context, options Options) error {
 	_ = writeStatus(options, "waiting_for_sign_in", "Sign in to your configured Microsoft account in the Edge window. Complete MFA there if requested.")
-	_, err = b.call(ctx, "Page.navigate", map[string]any{"url": challenge.AuthorizationURL}, b.session)
+	_, err := b.call(ctx, "Page.navigate", map[string]any{"url": b.challenge.AuthorizationURL}, b.session)
 	if err != nil && b.callback == "" {
 		return err
 	}
@@ -312,6 +397,10 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 			return err
 		}
 	}
+	return nil
+}
+
+func (b *browser) portalCookies(ctx context.Context, options Options) ([]auth.SSOCookie, []auth.SSOCookie, error) {
 	_ = writeStatus(options, "saving", "Verifying the Microsoft sign-in and saving renewed credentials.")
 	_, _ = b.call(ctx, "Fetch.disable", map[string]any{}, b.session)
 	// Opening the portal establishes its own browser cookies for sidebar and
@@ -319,23 +408,19 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 	_, _ = b.call(ctx, "Page.navigate", map[string]any{"url": "https://m365.cloud.microsoft/"}, b.session)
 	select {
 	case <-ctx.Done():
-		return errors.New("Sign-in timed out before credentials could be saved.")
+		return nil, nil, errors.New("sign-in timed out before credentials could be saved")
 	case <-time.After(5 * time.Second):
 	}
-	data, err = b.call(ctx, "Network.getCookies", map[string]any{"urls": []string{challenge.AuthorizationURL, "https://m365.cloud.microsoft/", "https://m365.cloud.microsoft/chat/"}}, b.session)
+	data, err := b.call(ctx, "Network.getCookies", map[string]any{"urls": []string{b.challenge.AuthorizationURL, "https://m365.cloud.microsoft/", "https://m365.cloud.microsoft/chat/"}}, b.session)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	var cookies struct {
 		Cookies []auth.SSOCookie `json:"cookies"`
 	}
 	if json.Unmarshal(data, &cookies) != nil {
-		return errors.New("The browser session could not be read.")
+		return nil, nil, errors.New("the browser session could not be read")
 	}
 	login, portal := splitCookies(cookies.Cookies)
-	if err := tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal); err != nil {
-		return err
-	}
-	_ = writeStatus(options, "connected", "Microsoft account connected. Saved credentials and session cookies are available for automatic renewal.")
-	return nil
+	return login, portal, nil
 }

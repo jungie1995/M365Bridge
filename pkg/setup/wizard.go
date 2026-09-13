@@ -6,6 +6,7 @@ package setup
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -324,74 +325,102 @@ func splitCookiesByDomain(cookies []auth.SSOCookie) ([]auth.SSOCookie, []auth.SS
 	return loginCookies, m365Cookies
 }
 
-// getConfigFromFile reads setup JSON from a file.
-// Returns tenant, oid, refresh token, SSO cookies, and error.
-func getConfigFromFile(path string) (string, string, string, []auth.SSOCookie, error) {
+// setupFile is the shape of the JSON the operator hands the setup wizard.
+type setupFile struct {
+	OID          string           `json:"oid"`
+	Tenant       string           `json:"tenant"`
+	RefreshToken string           `json:"refresh_token"`
+	SSOCookies   []auth.SSOCookie `json:"sso_cookies"`
+}
+
+// readSetupJSON reads and decodes the setup file. A file the operator pasted
+// console output into carries the object inside surrounding text, so a failed
+// decode is retried against the first braced span rather than refused.
+func readSetupJSON(path string) (setupFile, error) {
+	var parsed setupFile
+
 	// The path is the -file argument the operator typed at the setup wizard.
 	// #nosec G304
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", "", nil, fmt.Errorf("failed to read file %s: %w", path, err)
+		return parsed, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
 	raw := strings.TrimSpace(string(data))
 	if raw == "" {
-		return "", "", "", nil, fmt.Errorf("file %s is empty", path)
+		return parsed, fmt.Errorf("file %s is empty", path)
 	}
 
-	// Parse JSON directly
-	var parsed struct {
-		OID          string           `json:"oid"`
-		Tenant       string           `json:"tenant"`
-		RefreshToken string           `json:"refresh_token"`
-		SSOCookies   []auth.SSOCookie `json:"sso_cookies"`
-	}
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		// Try extracting JSON from surrounding text
-		jsonPattern := regexp.MustCompile(`\{.*\}`)
-		if match := jsonPattern.FindString(raw); match != "" {
-			if err2 := json.Unmarshal([]byte(match), &parsed); err2 != nil {
-				return "", "", "", nil, fmt.Errorf("failed to parse JSON from file: %w", err)
-			}
-		} else {
-			return "", "", "", nil, fmt.Errorf("failed to parse JSON from file: %w", err)
-		}
+	err = json.Unmarshal([]byte(raw), &parsed)
+	if err == nil {
+		return parsed, nil
 	}
 
+	match := regexp.MustCompile(`\{.*\}`).FindString(raw)
+	if match == "" {
+		return parsed, fmt.Errorf("failed to parse JSON from file: %w", err)
+	}
+	if err2 := json.Unmarshal([]byte(match), &parsed); err2 != nil {
+		return parsed, fmt.Errorf("failed to parse JSON from file: %w", err)
+	}
+	return parsed, nil
+}
+
+// validateSetupFile refuses the values the wizard cannot tell apart from the
+// example text, before anything is written or redeemed.
+func validateSetupFile(parsed setupFile, path string) error {
 	if parsed.Tenant == "" || parsed.OID == "" {
-		return "", "", "", nil, fmt.Errorf("missing tenant or oid in JSON")
+		return fmt.Errorf("missing tenant or oid in JSON")
 	}
 	if err := validateGUIDField("tenant", parsed.Tenant); err != nil {
-		return "", "", "", nil, err
+		return err
 	}
 	if err := validateGUIDField("oid", parsed.OID); err != nil {
-		return "", "", "", nil, err
+		return err
 	}
 	if parsed.RefreshToken == "" || parsed.RefreshToken == "NOT_FOUND" {
-		return "", "", "", nil, fmt.Errorf("missing or invalid refresh_token in JSON")
+		return fmt.Errorf("missing or invalid refresh_token in JSON")
 	}
 	// A Microsoft refresh token runs to thousands of characters. A short value
 	// is the example text left in place of a real one, and it is refused here
 	// rather than stored, because the token endpoint answers a placeholder with
 	// "request is malformed", which reads like a broken install.
 	if len(parsed.RefreshToken) < minRefreshTokenLength {
-		return "", "", "", nil, fmt.Errorf(
+		return fmt.Errorf(
 			"refresh_token in %s is %d characters, which is too short to be a real token; copy the value the browser console printed",
 			path, len(parsed.RefreshToken))
 	}
+	return nil
+}
 
-	// If refresh_token is a JSON object, try extracting secret/value/data fields
-	// If none found, use the entire JSON string as-is
-	refreshToken := parsed.RefreshToken
+// refreshTokenSecret unwraps a refresh token the operator copied as a JSON
+// object. With no secret or value field the whole string is the token.
+func refreshTokenSecret(refreshToken string) string {
 	var rtObj map[string]any
-	if err := json.Unmarshal([]byte(refreshToken), &rtObj); err == nil {
-		if secret, ok := rtObj["secret"].(string); ok && secret != "" {
-			refreshToken = secret
-		} else if value, ok := rtObj["value"].(string); ok && value != "" {
-			refreshToken = value
-		}
-		// If no secret/value, keep the entire JSON string as refresh_token
+	if err := json.Unmarshal([]byte(refreshToken), &rtObj); err != nil {
+		return refreshToken
 	}
+	if secret, ok := rtObj["secret"].(string); ok && secret != "" {
+		return secret
+	}
+	if value, ok := rtObj["value"].(string); ok && value != "" {
+		return value
+	}
+	return refreshToken
+}
+
+// getConfigFromFile reads setup JSON from a file.
+// Returns tenant, oid, refresh token, SSO cookies, and error.
+func getConfigFromFile(path string) (string, string, string, []auth.SSOCookie, error) {
+	parsed, err := readSetupJSON(path)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	if err := validateSetupFile(parsed, path); err != nil {
+		return "", "", "", nil, err
+	}
+
+	refreshToken := refreshTokenSecret(parsed.RefreshToken)
 
 	fmt.Printf("  OID: %s\n", parsed.OID)
 	fmt.Printf("  Tenant: %s\n", parsed.Tenant)
@@ -481,8 +510,11 @@ func verifyToken(tenant, oid, refreshToken string) (string, string, error) {
 
 // saveEnv saves the environment configuration to .env file.
 func saveEnv(tenant, oid string) error {
-	envContent := fmt.Sprintf("# M365 Copilot Configuration\nM365_TENANT_ID=%s\nM365_USER_OID=%s\nM365_CLIENT_ID=%s\n",
-		tenant, oid, models.DefaultClientID)
+	existing, err := os.ReadFile(defaultEnvFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to read existing environment file: %w", err)
+	}
+	envContent := mergeIdentityEnv(string(existing), tenant, oid)
 
 	if err := atomicfile.Write(defaultEnvFile, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("failed to save environment file: %w", err)
@@ -490,4 +522,36 @@ func saveEnv(tenant, oid string) error {
 
 	fmt.Printf("  Environment variables saved to %s\n", defaultEnvFile)
 	return nil
+}
+
+// Account setup updates identity only. Operator settings, especially the API
+// key and tool-round limit, must survive initial setup and later reimports.
+func mergeIdentityEnv(original, tenant, oid string) string {
+	keys := []string{"M365_TENANT_ID", "M365_USER_OID", "M365_CLIENT_ID"}
+	values := map[string]string{"M365_TENANT_ID": tenant, "M365_USER_OID": oid, "M365_CLIENT_ID": models.DefaultClientID}
+	original = strings.TrimRight(original, "\r\n")
+	if original == "" {
+		original = "# M365 Copilot Configuration"
+	}
+	var lines []string
+	seen := make(map[string]bool)
+	for line := range strings.SplitSeq(original, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		key, _, _ := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if value, ok := values[key]; ok {
+			if seen[key] {
+				continue
+			}
+			line = key + "=" + value
+			seen[key] = true
+		}
+		lines = append(lines, line)
+	}
+	for _, key := range keys {
+		if !seen[key] {
+			lines = append(lines, key+"="+values[key])
+		}
+	}
+	return strings.Join(lines, "\n") + "\n"
 }

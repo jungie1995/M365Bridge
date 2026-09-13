@@ -90,22 +90,29 @@ func taskPlan(call LedgerCall) (TaskState, bool) {
 	var state TaskState
 	seen := map[string]bool{}
 	for _, item := range items {
-		labelText := strings.TrimSpace(item[label])
-		key := taskKey(labelText)
-		if key == "" || seen[key] {
-			return TaskState{}, false
-		}
-		seen[key] = true
-		switch item["status"] {
-		case "pending", "in_progress":
-			state.Pending = append(state.Pending, labelText)
-		case "completed", "cancelled", "canceled", "blocked":
-			state.closed = append(state.closed, labelText)
-		default:
+		if !appendPlanItem(&state, item, label, seen) {
 			return TaskState{}, false
 		}
 	}
 	return state, true
+}
+
+func appendPlanItem(state *TaskState, item map[string]string, label string, seen map[string]bool) bool {
+	text := strings.TrimSpace(item[label])
+	key := taskKey(text)
+	if key == "" || seen[key] {
+		return false
+	}
+	seen[key] = true
+	switch item["status"] {
+	case "pending", "in_progress":
+		state.Pending = append(state.Pending, text)
+	case "completed", "cancelled", "canceled", "blocked":
+		state.closed = append(state.closed, text)
+	default:
+		return false
+	}
+	return true
 }
 
 func taskKey(label string) string { return strings.Join(strings.Fields(label), " ") }

@@ -9,6 +9,7 @@ import (
 	// md5 is used only to derive cache file names and session ids, never as a
 	// security primitive.
 	"crypto/md5" // #nosec G501
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime/multipart"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -573,6 +575,10 @@ func (api *APIServer) Stop() error {
 
 // handleHealth handles health check requests.
 func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// A liveness probe reports the moment it is asked about, so no cache may
+	// answer it on the process's behalf.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 }
@@ -648,7 +654,9 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		"last_id":  lastOrNil(ids),
 	}
 
-	api.sendJSON(w, http.StatusOK, response)
+	// The catalog is built from the registry and from configuration fixed at
+	// startup, so it is the one JSON body here a caller may hold.
+	api.sendCachedJSON(w, r, response, "public, max-age=300")
 }
 
 // supportsReasoningRoute reports whether any registry key for one advertised
@@ -1095,32 +1103,44 @@ func (api *APIServer) handleConversation(w http.ResponseWriter, r *http.Request)
 	conversationClient := client.NewConversationClient(api.tokenManager)
 	switch r.Method {
 	case http.MethodPatch:
-		var req struct {
-			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-			api.sendError(w, http.StatusBadRequest, "Invalid request body")
-			return
-		}
-		if strings.TrimSpace(req.Name) == "" {
-			api.sendError(w, http.StatusBadRequest, "name is required")
-			return
-		}
-		if err := conversationClient.RenameConversation(r.Context(), conversationID, strings.TrimSpace(req.Name)); err != nil {
-			api.sendConversationError(w, err)
-			return
-		}
-		api.sendJSON(w, http.StatusOK, map[string]any{"id": conversationID, "name": strings.TrimSpace(req.Name)})
+		api.renameConversation(w, r, conversationClient, conversationID)
 	case http.MethodDelete:
-		if err := conversationClient.DeleteConversation(r.Context(), conversationID); err != nil {
-			api.sendConversationError(w, err)
-			return
-		}
-		api.dropSessionsFor(conversationID)
-		w.WriteHeader(http.StatusNoContent)
+		api.deleteConversation(w, r, conversationClient, conversationID)
 	default:
 		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
+}
+
+// renameConversation gives an M365 web conversation a new name.
+func (api *APIServer) renameConversation(w http.ResponseWriter, r *http.Request, conversationClient *client.ConversationClient, conversationID string) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		api.sendError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		api.sendError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := conversationClient.RenameConversation(r.Context(), conversationID, name); err != nil {
+		api.sendConversationError(w, err)
+		return
+	}
+	api.sendJSON(w, http.StatusOK, map[string]any{"id": conversationID, "name": name})
+}
+
+// deleteConversation removes the conversation upstream and drops every session
+// bound to it, because more than one session can point at one conversation.
+func (api *APIServer) deleteConversation(w http.ResponseWriter, r *http.Request, conversationClient *client.ConversationClient, conversationID string) {
+	if err := conversationClient.DeleteConversation(r.Context(), conversationID); err != nil {
+		api.sendConversationError(w, err)
+		return
+	}
+	api.dropSessionsFor(conversationID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // readConversationHistory imports the turns of a conversation this gateway
@@ -1372,90 +1392,133 @@ func replaceRequestTools(body []byte, tools []toolcalling.ToolDef) string {
 // loop feeds therefore do not store the mapping again.
 func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, sid, convID string, tools []toolcalling.ToolDef, noParallel bool, local map[string]bool) (toolLoopResult, error) {
 	currentConvID := convID
-	var executed []toolcalling.LedgerCall
-	var observed []toolcalling.LedgerResult
+	progress := localToolEvidence{tasks: buildToolLedger(messages).Tasks}
 	for iteration := 0; ; iteration++ {
 		text, thinking, backendCalls, finishReason, finalConvID, err := api.m365Client.ChatConversationContext(r.Context(), messages, cfg.Tone, cfg.Override, currentConvID, api.config.UserOID, api.config.TenantID, len(tools) > 0)
 		if err != nil {
 			return toolLoopResult{conversationID: currentConvID}, err
 		}
-		if finalConvID != "" {
-			currentConvID = finalConvID
-			if sid != "" {
-				api.ctxCache.Set(sessionKeyPrefix+sid, finalConvID)
-			}
-		}
+		currentConvID = api.rememberConversation(sid, currentConvID, finalConvID)
 		if len(tools) == 0 {
 			_, finishReason = withoutBackendToolCalls(backendCalls, finishReason)
 			return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: currentConvID}, nil
 		}
+
 		contracts := toolcalling.ContractsFor(tools).WithoutParallel(noParallel)
-		var simulated toolcalling.SimulatedResult
-		if provider == toolLoopAnthropic {
-			simulated = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
-		} else {
-			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
-		}
+		simulated := parseLoopSimulation(provider, text, tools, contracts)
 		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, simulated)
-		progress := toolcalling.BuildLedger(executed, observed, iteration)
-		progress.Tasks = buildToolLedger(messages).Tasks
-		simulated, progressErr := guardToolProgress(progress, "auto", simulated)
-		if progressErr != nil {
-			return toolLoopResult{conversationID: currentConvID}, progressErr
+		if _, err := guardToolProgress(progress.ledger(iteration), "auto", simulated); err != nil {
+			return toolLoopResult{conversationID: currentConvID}, err
 		}
-		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
-			if simulated.HasPayload {
-				text, finishReason = simulated.Content, "stop"
-			}
-			return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: currentConvID}, nil
+		if answer, done := answerWithoutCalls(simulated, text, thinking, finishReason, currentConvID); done {
+			return answer, nil
 		}
-		var callerCalls []client.ToolCall
-		var localCalls []toolcalling.ToolCall
-		for _, call := range simulated.ToolCalls {
-			converted := clientToolCallFromSimulated(call)
-			if local[call.Name] {
-				localCalls = append(localCalls, call)
-			} else {
-				callerCalls = append(callerCalls, converted)
-			}
-		}
+
+		callerCalls, localCalls := splitToolCalls(simulated.ToolCalls, local)
 		if len(callerCalls) > 0 {
 			return toolLoopResult{thinking: thinking, toolCalls: callerCalls, finishReason: "tool_calls", conversationID: currentConvID}, nil
 		}
 		if iteration >= api.config.CodeToolMaxIterations-1 {
 			return toolLoopResult{conversationID: currentConvID}, errors.New("coding tool iteration limit reached")
 		}
-		var resultParts []string
-		for index, call := range localCalls {
-			var arguments map[string]any
-			if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
-				arguments = map[string]any{}
-			}
-			encoded, err := codingtools.MarshalResult(api.codeTools.Execute(r.Context(), call.Name, arguments))
-			if err != nil {
-				return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("serialize coding tool result: %w", err)
-			}
-			// Internal evidence ids remain unique even if the simulated backend
-			// reuses a wire id on a later iteration.
-			evidenceID := fmt.Sprintf("local-%d-%d", iteration, index)
-			executed = append(executed, toolcalling.LedgerCall{ID: evidenceID, Name: call.Name, Arguments: string(call.Arguments)})
-			observed = append(observed, toolcalling.LedgerResult{ID: evidenceID, Content: string(encoded)})
-			resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
-		}
-		messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
-		request := map[string]any{"model": cfg.OpenAIID, "messages": messages, "tools": tools, "stream": false}
-		requestJSON, err := json.Marshal(request)
+
+		resultParts, err := api.executeLocalCalls(r, localCalls, &progress)
 		if err != nil {
-			return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("serialize coding tool continuation: %w", err)
+			return toolLoopResult{conversationID: currentConvID}, err
 		}
-		if provider == toolLoopAnthropic {
-			// The synthetic messages of the built-in loop carry no client tool
-			// structure, so there is no ledger to pass here.
-			injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto", "")
-		} else {
-			injectSimulatedPrompt(&messages, string(requestJSON), "auto", "")
+		messages, err = appendToolLoopContinuation(messages, resultParts, cfg, tools, provider)
+		if err != nil {
+			return toolLoopResult{conversationID: currentConvID}, err
 		}
 	}
+}
+
+// rememberConversation stores the conversation the backend answered on, so the
+// next turn of this session continues it rather than starting a new one.
+func (api *APIServer) rememberConversation(sid, currentConvID, finalConvID string) string {
+	if finalConvID == "" {
+		return currentConvID
+	}
+	if sid != "" {
+		api.ctxCache.Set(sessionKeyPrefix+sid, finalConvID)
+	}
+	return finalConvID
+}
+
+// parseLoopSimulation parses the backend's answer in the provider's own shape.
+func parseLoopSimulation(provider toolLoopProvider, text string, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts) toolcalling.SimulatedResult {
+	if provider == toolLoopAnthropic {
+		return toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
+	}
+	return toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
+}
+
+// answerWithoutCalls reports the turn's plain answer when the simulation
+// produced no tool call, which is a legitimate outcome rather than a failure.
+func answerWithoutCalls(sim toolcalling.SimulatedResult, text, thinking, finishReason, convID string) (toolLoopResult, bool) {
+	if sim.HasPayload && len(sim.ToolCalls) > 0 {
+		return toolLoopResult{}, false
+	}
+	if sim.HasPayload {
+		text, finishReason = sim.Content, "stop"
+	}
+	return toolLoopResult{text: text, thinking: thinking, finishReason: finishReason, conversationID: convID}, true
+}
+
+// splitToolCalls separates the calls this gateway runs itself from the ones
+// only the client can run.
+func splitToolCalls(calls []toolcalling.ToolCall, local map[string]bool) ([]client.ToolCall, []toolcalling.ToolCall) {
+	var callerCalls []client.ToolCall
+	var localCalls []toolcalling.ToolCall
+	for _, call := range calls {
+		if local[call.Name] {
+			localCalls = append(localCalls, call)
+			continue
+		}
+		callerCalls = append(callerCalls, clientToolCallFromSimulated(call))
+	}
+	return callerCalls, localCalls
+}
+
+// executeLocalCalls runs the built-in coding tools and renders their results.
+//
+// The arguments are normalized before they identify a call, because a model
+// that re-emits the same call with its JSON keys in another order is repeating
+// it, not asking something new.
+func (api *APIServer) executeLocalCalls(r *http.Request, localCalls []toolcalling.ToolCall, progress *localToolEvidence) ([]string, error) {
+	var resultParts []string
+	for _, call := range localCalls {
+		var arguments map[string]any
+		if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
+			arguments = map[string]any{}
+		}
+		encoded, err := codingtools.MarshalResult(api.codeTools.Execute(r.Context(), call.Name, arguments))
+		if err != nil {
+			return nil, fmt.Errorf("serialize coding tool result: %w", err)
+		}
+		progress.record(call, string(encoded))
+		resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
+	}
+	return resultParts, nil
+}
+
+// appendToolLoopContinuation adds the tool results to the conversation and
+// re-injects the request envelope, so the next turn sees the same contract.
+func appendToolLoopContinuation(messages []payload.Message, resultParts []string, cfg models.ModelConfig, tools []toolcalling.ToolDef, provider toolLoopProvider) ([]payload.Message, error) {
+	messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
+	request := map[string]any{"model": cfg.OpenAIID, "messages": messages, "tools": tools, "stream": false}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("serialize coding tool continuation: %w", err)
+	}
+	// The synthetic messages of the built-in loop carry no client tool
+	// structure, so there is no ledger to pass here.
+	if provider == toolLoopAnthropic {
+		injectSimulatedPromptAnthropic(&messages, string(requestJSON), "auto", "")
+	} else {
+		injectSimulatedPrompt(&messages, string(requestJSON), "auto", "")
+	}
+	return messages, nil
 }
 
 // repairSimulatedToolCalls performs a single corrective re-ask when the initial
@@ -1472,37 +1535,9 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 		return sim
 	}
 
-	var note string
-	narrated := false
-	ledger := buildToolLedger(messages)
-	switch {
-	case ledger.Tasks.Unfinished() && !toolcalling.TaskBlocked(sim.Content):
-		note = toolcalling.TaskContinuityInstruction + "\n" + ledger.Tasks.Note()
-		logging.Warn("repairSimulatedToolCalls: requesting continuation of an acknowledged unfinished plan")
-	case len(sim.DroppedCalls) > 0:
-		note = toolcalling.BuildRepairNote(sim.DroppedCalls, contracts)
-		logging.Warnf("repairSimulatedToolCalls: re-asking backend, tool calls failed validation: %v", sim.DroppedCalls)
-	default:
-		// The backend produced no tool call at all. That is only worth a re-ask
-		// when the reply denies the tools exist, claims the work already ran
-		// elsewhere, or only announces which tool it means to use; an ordinary
-		// text answer is a legitimate outcome.
-		answer := sim.Content
-		if answer == "" {
-			answer = rawText
-		}
-		switch {
-		case toolcalling.IsToolRefusal(answer):
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply denied the declared tools exist")
-		case toolcalling.IsSandboxHallucination(answer):
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply claimed to have run the work itself")
-		case toolcalling.IsToolIntentNarration(answer, toolNamesFromDefs(tools)):
-			narrated = true
-			logging.Warn("repairSimulatedToolCalls: re-asking backend, reply only announced which tool it would use")
-		default:
-			return sim
-		}
-		note = toolcalling.BuildNativeToolBanNote()
+	note, narrated, worthRetrying := continuationRepairNote(sim, messages, tools, contracts, rawText)
+	if !worthRetrying {
+		return sim
 	}
 
 	retry := make([]payload.Message, len(messages))
@@ -1517,12 +1552,7 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 		return sim
 	}
 
-	var retried toolcalling.SimulatedResult
-	if provider == toolLoopAnthropic {
-		retried = toolcalling.ParseSimulatedResponseAnthropic(text, toolNamesFromDefs(tools), contracts)
-	} else {
-		retried = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
-	}
+	retried := parseLoopSimulation(provider, text, tools, contracts)
 	if len(retried.ToolCalls) > 0 {
 		logging.Infof("repairSimulatedToolCalls: recovered %d tool call(s) after re-ask", len(retried.ToolCalls))
 		return retried
@@ -1540,46 +1570,119 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 	return sim
 }
 
+// repairNote decides whether a re-ask is worth making, and what note to append.
+//
+// A dropped call is always worth re-asking. With no call at all it is only
+// worth it when the reply denies the tools exist, claims the work already ran
+// elsewhere, or only announces which tool it means to use; an ordinary text
+// answer is a legitimate outcome.
+func repairNote(sim toolcalling.SimulatedResult, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string) (note string, narrated, worthRetrying bool) {
+	if len(sim.DroppedCalls) > 0 {
+		logging.Warnf("repairSimulatedToolCalls: re-asking backend, tool calls failed validation: %v", sim.DroppedCalls)
+		return toolcalling.BuildRepairNote(sim.DroppedCalls, contracts), false, true
+	}
+
+	answer := sim.Content
+	if answer == "" {
+		answer = rawText
+	}
+	switch {
+	case toolcalling.IsToolRefusal(answer):
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply denied the declared tools exist")
+	case toolcalling.IsSandboxHallucination(answer):
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply claimed to have run the work itself")
+	case toolcalling.IsToolIntentNarration(answer, toolNamesFromDefs(tools)):
+		narrated = true
+		logging.Warn("repairSimulatedToolCalls: re-asking backend, reply only announced which tool it would use")
+	default:
+		return "", false, false
+	}
+	return toolcalling.BuildNativeToolBanNote(), narrated, true
+}
+
 // handleChatCompletions handles OpenAI chat completion requests.
-func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+// chatCompletionsRequest is the wire shape of a /v1/chat/completions request.
+type chatCompletionsRequest struct {
+	Model          string                `json:"model"`
+	Messages       []payload.Message     `json:"messages"`
+	Stream         bool                  `json:"stream"`
+	MaxTokens      int                   `json:"max_tokens"`
+	ResponseFormat map[string]any        `json:"response_format"`
+	SessionID      string                `json:"session_id"`
+	User           string                `json:"user"`
+	Tools          []toolcalling.ToolDef `json:"tools"`
+	ToolChoice     any                   `json:"tool_choice"`
+	// A pointer, because an absent parallel_tool_calls means the OpenAI
+	// default of true rather than false.
+	ParallelToolCalls *bool          `json:"parallel_tool_calls"`
+	StreamOptions     *streamOptions `json:"stream_options"`
+	// Either a single string or an array of them, so it arrives untyped.
+	Stop any `json:"stop"`
+}
+
+// readJSONRequest answers the method gate and decodes the body into dst. It
+// returns the raw bytes, because a tool-enabled request re-serializes them into
+// the simulation prompt. ok is false when the request has already been answered.
+func (api *APIServer) readJSONRequest(w http.ResponseWriter, r *http.Request, dst any, op string) (bodyBytes []byte, ok bool) {
 	if r.Method == http.MethodOptions {
 		api.handleCORS(w, r)
-		return
+		return nil, false
 	}
 	if r.Method != http.MethodPost {
 		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
+		return nil, false
 	}
 
 	limitRequestBody(w, r, requestBodyMax)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		api.sendRequestBodyError(w, err)
-		return
+		return nil, false
 	}
 	_ = r.Body.Close()
 
-	var req struct {
-		Model          string                `json:"model"`
-		Messages       []payload.Message     `json:"messages"`
-		Stream         bool                  `json:"stream"`
-		MaxTokens      int                   `json:"max_tokens"`
-		ResponseFormat map[string]any        `json:"response_format"`
-		SessionID      string                `json:"session_id"`
-		User           string                `json:"user"`
-		Tools          []toolcalling.ToolDef `json:"tools"`
-		ToolChoice     any                   `json:"tool_choice"`
-		// A pointer, because an absent parallel_tool_calls means the OpenAI
-		// default of true rather than false.
-		ParallelToolCalls *bool          `json:"parallel_tool_calls"`
-		StreamOptions     *streamOptions `json:"stream_options"`
-		// Either a single string or an array of them, so it arrives untyped.
-		Stop any `json:"stop"`
-	}
-
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		logging.Errorf("handleChatCompletions: invalid JSON: %v", err)
+	if err := json.Unmarshal(bodyBytes, dst); err != nil {
+		logging.Errorf("%s: invalid JSON: %v", op, err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return nil, false
+	}
+	return bodyBytes, true
+}
+
+// prepareToolLedger rebuilds the evidence of a client-driven tool loop and
+// refuses a request whose tool results do not line up with its calls. ok is
+// false when the request has already been answered.
+func (api *APIServer) prepareToolLedger(w http.ResponseWriter, messages []payload.Message, op string) (toolcalling.Ledger, bool) {
+	if err := validateToolResultMessages(messages); err != nil {
+		logging.Errorf("%s: %v", op, err)
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return toolcalling.Ledger{}, false
+	}
+	ledger := buildToolLedger(messages)
+	if api.exceededToolRoundLimit(ledger) {
+		api.sendToolRoundLimitError(w, ledger)
+		return toolcalling.Ledger{}, false
+	}
+	return ledger, true
+}
+
+// sessionAndConversation resolves the session this request belongs to and the
+// conversation that session is bound to.
+func (api *APIServer) sessionAndConversation(r *http.Request, sources sessionSources, messages []payload.Message) (sid, convID string) {
+	sid = resolveSessionID(r, sources)
+	if sid == "" {
+		sid = api.hashSessionIDFromMessages(r, messages)
+	}
+	if sid == "" {
+		return "", ""
+	}
+	return sid, api.ctxCache.Get(sessionKeyPrefix + sid)
+}
+
+func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	var req chatCompletionsRequest
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleChatCompletions")
+	if !ok {
 		return
 	}
 
@@ -1591,14 +1694,8 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	if err := validateToolResultMessages(req.Messages); err != nil {
-		logging.Errorf("handleChatCompletions: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(req.Messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleChatCompletions")
+	if !ok {
 		return
 	}
 
@@ -1613,30 +1710,19 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// The declaration list stays whole in requestJSON so the model sees every
 	// capability, but simulation only runs when something is left for the
 	// client to execute.
-	if len(toolcalling.RouteableTools(req.Tools)) > 0 {
+	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
+	if hasTools {
 		injectSimulatedPrompt(&req.Messages, requestJSON, toolChoiceString(req.ToolChoice), ledger.EvidenceNote())
 	}
 
-	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:   modelSessionID,
 		BodySessionID: req.SessionID,
 		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, req.Messages)
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, req.Messages)
 
 	// Upload any images found in multimodal content and attach annotations
 	api.uploadImagesAndAnnotate(&req.Messages, convID)
-
-	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
 
 	// Recorded before the turn runs, so a turn that fails still shows the
 	// message the caller sent rather than losing it.
@@ -1646,19 +1732,25 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	stopSequences := openAIStopSequences(req.Stop)
 
 	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, sid, convID, req.Tools, noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "chat", err)
-			return
-		}
-		api.respondBufferedChat(w, result, req.Messages, cfg, sid, req.MaxTokens, req.Stream, req.Tools, toolChoiceString(req.ToolChoice), stopSequences)
+		api.runChatToolLoop(w, r, req, cfg, sid, convID, localTools, noParallel, stopSequences)
 		return
 	}
 	if req.Stream {
 		api.streamChatCompletions(r.Context(), w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel, includeStreamUsage(req.StreamOptions))
-	} else {
-		api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel)
+		return
 	}
+	api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel)
+}
+
+// runChatToolLoop runs the built-in coding tool loop for a chat request, which
+// answers whole rather than streaming because the loop takes several turns.
+func (api *APIServer) runChatToolLoop(w http.ResponseWriter, r *http.Request, req chatCompletionsRequest, cfg models.ModelConfig, sid, convID string, localTools map[string]bool, noParallel bool, stopSequences []string) {
+	result, err := api.runToolLoop(r, toolLoopOpenAI, req.Messages, cfg, sid, convID, req.Tools, noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "chat", err)
+		return
+	}
+	api.respondBufferedChat(w, result, req.Messages, cfg, sid, req.MaxTokens, req.Stream, req.Tools, toolChoiceString(req.ToolChoice), stopSequences)
 }
 
 // handleCompletions handles OpenAI text completion requests.
@@ -1813,43 +1905,27 @@ func (api *APIServer) handleAnthropicCountTokens(w http.ResponseWriter, r *http.
 }
 
 // handleAnthropicMessages handles Anthropic messages API requests.
+// anthropicMessagesRequest is the wire shape of a /v1/messages request.
+type anthropicMessagesRequest struct {
+	Model       string                `json:"model"`
+	Messages    []payload.Message     `json:"messages"`
+	System      json.RawMessage       `json:"system"`
+	MaxTokens   int                   `json:"max_tokens"`
+	Stream      bool                  `json:"stream"`
+	Temperature float64               `json:"temperature"`
+	Tools       []toolcalling.ToolDef `json:"tools"`
+	ToolChoice  map[string]any        `json:"tool_choice"`
+	// Anthropic declares stop_sequences as an array of strings, unlike
+	// OpenAI's stop, which is also a bare string.
+	StopSequences []string `json:"stop_sequences"`
+	SessionID     string   `json:"session_id"`
+	User          string   `json:"user"`
+}
+
 func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
-	var req struct {
-		Model       string                `json:"model"`
-		Messages    []payload.Message     `json:"messages"`
-		System      json.RawMessage       `json:"system"`
-		MaxTokens   int                   `json:"max_tokens"`
-		Stream      bool                  `json:"stream"`
-		Temperature float64               `json:"temperature"`
-		Tools       []toolcalling.ToolDef `json:"tools"`
-		ToolChoice  map[string]any        `json:"tool_choice"`
-		// Anthropic declares stop_sequences as an array of strings, unlike
-		// OpenAI's stop, which is also a bare string.
-		StopSequences []string `json:"stop_sequences"`
-		SessionID     string   `json:"session_id"`
-		User          string   `json:"user"`
-	}
-
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		logging.Errorf("handleAnthropicMessages: invalid JSON: %v", err)
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	var req anthropicMessagesRequest
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleAnthropicMessages")
+	if !ok {
 		return
 	}
 
@@ -1862,75 +1938,73 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	if err := validateToolResultMessages(req.Messages); err != nil {
-		logging.Errorf("handleAnthropicMessages: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(req.Messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleAnthropicMessages")
+	if !ok {
 		return
 	}
 
-	// Build chat messages with system prompt prepended. Claude Code can send
-	// Anthropic system as either a string or an array of text content blocks.
+	chatMessages, ok := api.anthropicChatMessages(w, req)
+	if !ok {
+		return
+	}
+
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, true)
+	req.Tools = preparedTools
+	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
+	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
+	if hasTools {
+		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice), ledger.EvidenceNote())
+	}
+
+	sid, convID := api.sessionAndConversation(r, sessionSources{
+		ModelSuffix:   modelSessionID,
+		BodySessionID: req.SessionID,
+		BodyUser:      req.User,
+	}, chatMessages)
+
+	// Upload any images found in multimodal content and attach annotations
+	api.uploadImagesAndAnnotate(&chatMessages, convID)
+
+	noParallel := anthropicRefusesParallelToolCalls(req.ToolChoice)
+
+	if len(localTools) > 0 {
+		api.runAnthropicToolLoop(w, r, req, chatMessages, cfg, sid, convID, localTools, noParallel)
+		return
+	}
+	if req.Stream {
+		api.streamAnthropicMessages(r.Context(), w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
+		return
+	}
+	api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
+}
+
+// anthropicChatMessages prepends the system prompt to the turn. Claude Code can
+// send Anthropic system as either a string or an array of text content blocks.
+// ok is false when the request has already been answered.
+func (api *APIServer) anthropicChatMessages(w http.ResponseWriter, req anthropicMessagesRequest) ([]payload.Message, bool) {
 	systemPrompt, err := normalizeAnthropicSystem(req.System)
 	if err != nil {
 		logging.Errorf("handleAnthropicMessages: invalid system field: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid system field: %v", err))
-		return
+		return nil, false
 	}
 
 	chatMessages := []payload.Message{}
 	if systemPrompt != "" {
 		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: systemPrompt})
 	}
-	chatMessages = append(chatMessages, req.Messages...)
+	return append(chatMessages, req.Messages...), true
+}
 
-	preparedTools, localTools := api.prepareCodingTools(req.Tools, true)
-	req.Tools = preparedTools
-	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
-	if len(toolcalling.RouteableTools(req.Tools)) > 0 {
-		injectSimulatedPromptAnthropic(&chatMessages, requestJSON, anthropicToolChoiceString(req.ToolChoice), ledger.EvidenceNote())
-	}
-
-	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
-		ModelSuffix:   modelSessionID,
-		BodySessionID: req.SessionID,
-		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, chatMessages)
-	}
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
-
-	// Upload any images found in multimodal content and attach annotations
-	api.uploadImagesAndAnnotate(&chatMessages, convID)
-
-	// Determine if client-defined tools are present (for optionsSets stripping)
-	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
-
-	noParallel := anthropicRefusesParallelToolCalls(req.ToolChoice)
-
-	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, sid, convID, req.Tools, noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "chat", err)
-			return
-		}
-		api.respondBufferedAnthropic(w, result, chatMessages, req.Model, sid, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
+// runAnthropicToolLoop runs the built-in coding tool loop for an Anthropic
+// request, which answers whole because the loop takes several turns.
+func (api *APIServer) runAnthropicToolLoop(w http.ResponseWriter, r *http.Request, req anthropicMessagesRequest, chatMessages []payload.Message, cfg models.ModelConfig, sid, convID string, localTools map[string]bool, noParallel bool) {
+	result, err := api.runToolLoop(r, toolLoopAnthropic, chatMessages, cfg, sid, convID, req.Tools, noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "chat", err)
 		return
 	}
-	if req.Stream {
-		api.streamAnthropicMessages(r.Context(), w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
-	} else {
-		api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
-	}
+	api.respondBufferedAnthropic(w, result, chatMessages, req.Model, req.MaxTokens, req.Stream, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences)
 }
 
 // handleAnthropicComplete handles Anthropic complete (FIM) requests.
@@ -2040,55 +2114,32 @@ func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages
 // data containing {"type":"completion","completion":"<delta>","stop_reason":null}.
 // The final event has stop_reason set and completion empty.
 func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
-	logID := fmt.Sprintf("cmpl_%s", uuid.New().String())
+	stream := &completeStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		model:   model,
+		logID:   fmt.Sprintf("cmpl_%s", uuid.New().String()),
+	}
 
 	// Send ping event (Anthropic streaming starts with ping)
-	pingData := map[string]any{"type": "ping"}
-	pingJSON, _ := json.Marshal(pingData)
+	pingJSON, _ := json.Marshal(map[string]any{"type": "ping"})
 	_, _ = fmt.Fprintf(w, "event: ping\ndata: %s\n\n", pingJSON)
 	flusher.Flush()
 
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
-
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	truncated := false
 
 	// A stop sequence can straddle two chunks, so the deltas pass through a
 	// writer that holds back the tail which could still complete one. Without
 	// it the first half of the sequence would already be on the wire by the
 	// time the completion is known to have ended.
 	stopWriter := newStopSequenceWriter(stopSequences)
-	sendCompletionDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		compData := map[string]any{
-			"type":        "completion",
-			"completion":  text,
-			"stop_reason": nil,
-			"model":       model,
-			"log_id":      logID,
-		}
-		compJSON, _ := json.Marshal(compData)
-		_, _ = fmt.Fprintf(w, "event: completion\ndata: %s\n\n", compJSON)
-		flusher.Flush()
-	}
 
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -2096,61 +2147,25 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			// The classification rather than the transport error, which names
-			// request URLs and credential file paths.
-			_, code, message := streamErrorFields("complete", chunk.Error)
-			errData := map[string]any{
-				"type":  "error",
-				"error": map[string]any{"type": code, "message": message},
-			}
-			errJSON, _ := json.Marshal(errData)
-			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
-			flusher.Flush()
+		step := stream.chunk(chunk, ch, maxTokens, stopWriter)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+		if step == streamLoopStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// The Complete wire format carries no thinking block, so reasoning is
-		// counted for the usage object but never emitted.
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			continue
-		}
-
-		// Check max_tokens limit
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// Once a stop sequence is reached the writer releases nothing more, but
-		// the loop keeps reading so the final frame still names the
-		// conversation this turn belongs to.
-		emit, _ := stopWriter.next(chunk.Text)
-		sendCompletionDelta(emit)
 	}
-	_ = finalToolCalls
+
 	// Whatever the writer held back belongs to the answer when no stop sequence
 	// ever arrived.
-	sendCompletionDelta(stopWriter.flush())
-	fullText := fullTextBuilder.String()
+	stream.delta(stopWriter.flush())
 
 	// Determine stop reason
 	stopReason := "end_turn"
 	if stopWriter.stoppedEarly() {
 		stopReason = "stop_sequence"
 	}
-	if truncated {
+	if stream.truncated {
 		stopReason = "max_tokens"
 	}
 
@@ -2161,29 +2176,136 @@ func (api *APIServer) streamAnthropicComplete(ctx context.Context, w http.Respon
 		"stop_reason": stopReason,
 		"model":       model,
 		"stop":        nullableString(stopWriter.matched()),
-		"log_id":      logID,
+		"log_id":      stream.logID,
 		// The intermediate events carry deltas, so usage belongs on the last
 		// one. The legacy Complete format defines no such field; it is reported
 		// so a caller reads the same counts here as on every other endpoint.
-		"usage": anthropicUsage(messages, nil, "", fullText, thinkingText.String()),
+		"usage": anthropicUsage(messages, nil, "", stream.fullText.String(), stream.thinking.String()),
 	}
-	api.storeSessionMapping(sid, finalConvID)
+	api.storeSessionMapping(sid, stream.convID)
 
 	finalJSON, _ := json.Marshal(finalData)
 	_, _ = fmt.Fprintf(w, "event: completion\ndata: %s\n\n", finalJSON)
 	flusher.Flush()
 }
 
-// streamChatCompletions streams chat completion responses in OpenAI format.
-func (api *APIServer) streamChatCompletions(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel, includeUsage bool) {
+// beginSSE writes the event-stream headers and reports the flusher every
+// streaming responder needs. ok is false when the request has already been
+// answered, which happens when the writer cannot flush.
+func (api *APIServer) beginSSE(w http.ResponseWriter) (http.Flusher, bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	// no-cache permits storage and only forces revalidation. A turn's answer
+	// exists once and cannot be revalidated, so storage is refused outright.
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return nil, false
+	}
+	return flusher, true
+}
+
+// drainStream reads the rest of an upstream turn, so its goroutine finishes
+// rather than blocking on a channel nobody reads.
+func drainStream(ch <-chan client.StreamChunk) {
+	for range ch {
+	}
+}
+
+// streamLoopStep says what a streaming responder does after one chunk.
+type streamLoopStep int
+
+const (
+	// streamLoopContinue keeps reading chunks.
+	streamLoopContinue streamLoopStep = iota
+	// streamLoopStop ends the turn and writes its final event.
+	streamLoopStop
+	// streamLoopFailed means the error event was already written.
+	streamLoopFailed
+)
+
+// completeStream carries what one legacy Complete turn accumulates.
+type completeStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	model   string
+	logID   string
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+}
+
+// delta writes one completion event and records the text it carried.
+func (s *completeStream) delta(text string) {
+	if text == "" {
+		return
+	}
+	s.fullText.WriteString(text)
+	compJSON, _ := json.Marshal(map[string]any{
+		"type":        "completion",
+		"completion":  text,
+		"stop_reason": nil,
+		"model":       s.model,
+		"log_id":      s.logID,
+	})
+	_, _ = fmt.Fprintf(s.w, "event: completion\ndata: %s\n\n", compJSON)
+	s.flusher.Flush()
+}
+
+// chunk reads one upstream chunk of a Complete turn.
+func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, stopWriter *stopSequenceWriter) streamLoopStep {
+	if chunk.Error != nil {
+		// The classification rather than the transport error, which names
+		// request URLs and credential file paths.
+		_, code, message := streamErrorFields("complete", chunk.Error)
+		errJSON, _ := json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": code, "message": message},
+		})
+		_, _ = fmt.Fprintf(s.w, "event: error\ndata: %s\n\n", errJSON)
+		s.flusher.Flush()
+		return streamLoopFailed
+	}
+
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return streamLoopStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// The Complete wire format carries no thinking block, so reasoning is
+	// counted for the usage object but never emitted.
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		return streamLoopContinue
+	}
+
+	// Check max_tokens limit
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// Once a stop sequence is reached the writer releases nothing more, but the
+	// loop keeps reading so the final frame still names the conversation this
+	// turn belongs to.
+	emit, _ := stopWriter.next(chunk.Text)
+	s.delta(emit)
+	return streamLoopContinue
+}
+
+// streamChatCompletions streams chat completion responses in OpenAI format.
+func (api *APIServer) streamChatCompletions(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel, includeUsage bool) {
+	flusher, ok := api.beginSSE(w)
+	if !ok {
 		return
 	}
 
@@ -2195,44 +2317,22 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 		return
 	}
 
-	chunkID := fmt.Sprintf("chatcmpl-%s", uuid.New().String())
-	openaiModel := cfg.OpenAIID
+	stream := &chatStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		chunkID: fmt.Sprintf("chatcmpl-%s", uuid.New().String()),
+		model:   cfg.OpenAIID,
+	}
 
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	hasContent := false
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	truncated := false
-
-	// When tool calling is enabled AND tools are present, buffer all text and
-	// parse for tool calls at the end. Tool call blocks may span multiple
-	// chunks, so we can't parse incrementally. When no tools are present, stream
-	// text directly regardless of the global ToolCalling flag.
-	toolCallingEnabled := hasTools
 
 	// A stop sequence can straddle two chunks, so the deltas of a directly
 	// streamed answer pass through a writer that holds back the tail which
 	// could still complete one. A tool-enabled turn is buffered whole, so it
 	// takes the trailing cut below instead.
 	stopWriter := newStopSequenceWriter(stopSequences)
-	sendContentDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		delta := map[string]any{"content": text}
-		if !hasContent {
-			delta["role"] = "assistant"
-			hasContent = true
-		}
-		api.sendSSEChunk(w, chunkID, openaiModel, delta)
-		flusher.Flush()
-	}
 
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -2240,150 +2340,224 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			api.sendSSEError(w, "chat", chunkID, openaiModel, chunk.Error)
+		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter, sid)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+		if step == streamLoopStop {
 			break
 		}
-
-		// A generated image arrives as a link to an address the browser cannot
-		// fetch, so it is rewritten to a route on this gateway before it goes
-		// out. The link arrives as a chunk of its own, so it is never split.
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Send thinking as reasoning_content (OpenAI extended thinking format)
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				// Live-stream filtered thinking so the transport envelope never
-				// leaks, matching the Anthropic streaming path.
-				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
-					payload := map[string]any{"reasoning_content": emit}
-					if !hasContent {
-						payload["role"] = "assistant"
-						hasContent = true
-					}
-					api.sendSSEChunk(w, chunkID, openaiModel, payload)
-					flusher.Flush()
-				}
-				continue
-			}
-			if !hasContent {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-					"role":              "assistant",
-					"reasoning_content": chunk.Thinking,
-				})
-				hasContent = true
-			} else {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-					"reasoning_content": chunk.Thinking,
-				})
-			}
-			flusher.Flush()
-			continue
-		}
-
-		// Check max_tokens limit before sending more content
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			// Drain remaining chunks
-			for range ch {
-			}
-			break
-		}
-
-		// If tool calling is not enabled, stream text directly. The writer
-		// decides what is safe to release, and it also feeds the accumulator,
-		// so the recorded answer matches what the client received.
-		if !toolCallingEnabled {
-			emit, _ := stopWriter.next(chunk.Text)
-			sendContentDelta(emit)
-			continue
-		}
-		fullTextBuilder.WriteString(chunk.Text)
 	}
-	if !toolCallingEnabled {
+	if !hasTools {
 		// Whatever the writer held back belongs to the answer when no stop
 		// sequence ever arrived.
-		sendContentDelta(stopWriter.flush())
-	}
-	fullText := fullTextBuilder.String()
-
-	// Parse simulated tool calls from full text if tool calling is enabled
-	var simToolCalls []toolcalling.ToolCall
-	if toolCallingEnabled {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendSSEError(w, "tool execution", chunkID, openaiModel, progressErr)
-			flusher.Flush()
-			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				simToolCalls = sim.ToolCalls
-				fullText = ""
-			} else {
-				fullText = sim.Content
-			}
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-		fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
-		// A tool-enabled turn is buffered whole and emitted below, so its stop
-		// sequence is applied here rather than through the writer.
-		if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
-			fullText = cut
-		}
+		stream.delta(stopWriter.flush())
 	}
 
-	if toolCallingEnabled {
-		if rem := thinkingFilter.Flush(); rem != "" {
-			payload := map[string]any{"reasoning_content": rem}
-			if !hasContent {
-				payload["role"] = "assistant"
-				hasContent = true
-			}
-			api.sendSSEChunk(w, chunkID, openaiModel, payload)
-			flusher.Flush()
-		}
-	}
-
-	// If tool calling buffered text, send it now as a single chunk
-	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
-		if !hasContent {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-				"role":    "assistant",
-				"content": fullText,
-			})
-			hasContent = true
-		} else {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-				"content": fullText,
-			})
-		}
+	fullText, simToolCalls, err := api.chatToolCalls(stream, messages, cfg, tools, toolChoice, stopSequences, hasTools, noParallel)
+	if err != nil {
+		api.sendSSEError(w, "tool execution", stream.chunkID, stream.model, err)
 		flusher.Flush()
+		return
 	}
 
 	// Send tool calls in stream if any (from M365 backend or simulated)
-	toolCalls, _ := withoutBackendToolCalls(finalToolCalls, "")
+	toolCalls, _ := withoutBackendToolCalls(stream.backendCalls, "")
+	toolCalls = appendSimulatedCalls(toolCalls, simToolCalls)
+	stream.emitToolCalls(toolCalls)
 
-	// Append simulated tool calls
+	api.updateChatStreamSession(sid, cfg.OpenAIID, stream.convID, fullText, stream.thinking.String(), toolCalls)
+
+	// Send final chunk with usage
+	api.sendSSEDone(w, stream.chunkID, stream.model, streamFinishReason(stream.truncated, toolCalls),
+		chatStreamUsage(includeUsage, messages, tools, toolChoice, fullText, stream.thinking.String()))
+	flusher.Flush()
+}
+
+// chatStream carries what one OpenAI chat completion turn streams.
+//
+// When tool calling is enabled AND tools are present, all text is buffered and
+// parsed for tool calls at the end: a tool call block may span several chunks,
+// so it cannot be parsed incrementally. With no tools the text streams directly.
+type chatStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	chunkID string
+	model   string
+
+	hasContent     bool
+	fullText       strings.Builder
+	thinking       strings.Builder
+	thinkingFilter toolcalling.ThinkingStreamFilter
+	truncated      bool
+	convID         string
+	backendCalls   []client.ToolCall
+}
+
+// send writes one delta, naming the assistant role on the first one the client
+// receives.
+func (s *chatStream) send(delta map[string]any) {
+	if !s.hasContent {
+		delta["role"] = "assistant"
+		s.hasContent = true
+	}
+	s.api.sendSSEChunk(s.w, s.chunkID, s.model, delta)
+	s.flusher.Flush()
+}
+
+// delta writes one content delta and records the text it carried.
+func (s *chatStream) delta(text string) {
+	if text == "" {
+		return
+	}
+	s.fullText.WriteString(text)
+	s.send(map[string]any{"content": text})
+}
+
+// reasoning writes one reasoning delta.
+func (s *chatStream) reasoning(text string) {
+	if text == "" {
+		return
+	}
+	s.send(map[string]any{"reasoning_content": text})
+}
+
+// streamThinking emits the reasoning summary as it arrives. A tool-enabled turn
+// filters it, because the transport envelope travels in the same channel.
+func (s *chatStream) streamThinking(text string, hasTools bool) {
+	s.thinking.WriteString(text)
+	if !hasTools {
+		s.reasoning(text)
+		return
+	}
+	// Live-stream filtered thinking so the transport envelope never leaks,
+	// matching the Anthropic streaming path.
+	s.reasoning(s.thinkingFilter.Feed(text))
+}
+
+// emitToolCalls writes the calls of a turn. They carry no content of their own,
+// so a turn that produced nothing else names the role on a null content delta.
+func (s *chatStream) emitToolCalls(toolCalls []client.ToolCall) {
+	if len(toolCalls) == 0 {
+		return
+	}
+	if !s.hasContent {
+		s.api.sendSSEChunk(s.w, s.chunkID, s.model, map[string]any{
+			"role":    "assistant",
+			"content": nil,
+		})
+	}
+	for i, tc := range toolCalls {
+		s.api.sendSSEChunk(s.w, s.chunkID, s.model, map[string]any{
+			"tool_calls": []map[string]any{
+				{
+					"index": i,
+					"id":    tc.ID,
+					"type":  "function",
+					"function": map[string]string{
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+					},
+				},
+			},
+		})
+	}
+	s.flusher.Flush()
+}
+
+// chunk reads one upstream chunk of a chat completion turn.
+func (s *chatStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, hasTools bool, stopWriter *stopSequenceWriter, sid string) streamLoopStep {
+	if chunk.Error != nil {
+		s.api.forgetSession(sid)
+		s.api.sendSSEError(s.w, "chat", s.chunkID, s.model, chunk.Error)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		s.backendCalls = chunk.ToolCalls
+		return streamLoopStop
+	}
+
+	// A generated image arrives as a link to an address the browser cannot
+	// fetch, so it is rewritten to a route on this gateway before it goes out.
+	// The link arrives as a chunk of its own, so it is never split.
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// Send thinking as reasoning_content (OpenAI extended thinking format)
+	if chunk.Thinking != "" {
+		s.streamThinking(chunk.Thinking, hasTools)
+		return streamLoopContinue
+	}
+
+	// Check max_tokens limit before sending more content
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// If tool calling is not enabled, stream text directly. The writer decides
+	// what is safe to release, and it also feeds the accumulator, so the
+	// recorded answer matches what the client received.
+	if !hasTools {
+		emit, _ := stopWriter.next(chunk.Text)
+		s.delta(emit)
+		return streamLoopContinue
+	}
+	s.fullText.WriteString(chunk.Text)
+	return streamLoopContinue
+}
+
+// chatToolCalls parses the simulated tool calls out of a buffered tool-enabled
+// turn and emits whatever text is left as one chunk. A turn with no tools
+// streamed its text already and passes through untouched.
+func (api *APIServer) chatToolCalls(stream *chatStream, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, hasTools, noParallel bool) (string, []toolcalling.ToolCall, error) {
+	fullText := stream.fullText.String()
+	if !hasTools {
+		return fullText, nil, nil
+	}
+
+	var simToolCalls []toolcalling.ToolCall
+	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, fullText)
+	if err != nil {
+		return "", nil, err
+	}
+	switch {
+	case !sim.HasPayload:
+		fullText = toolcalling.WithholdTransportEnvelope(fullText)
+		if toolcalling.IsContentPolicyBlock(fullText) {
+			// The stream is already open, so the refusal cannot be turned into
+			// an HTTP error the way the non-streaming paths do.
+			logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+		}
+	case len(sim.ToolCalls) > 0:
+		simToolCalls = sim.ToolCalls
+		fullText = ""
+	default:
+		fullText = sim.Content
+	}
+
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
+	// A tool-enabled turn is buffered whole and emitted here, so its stop
+	// sequence is applied now rather than through the writer.
+	if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
+		fullText = cut
+	}
+
+	// Whatever the thinking filter held back is released before the answer.
+	stream.reasoning(stream.thinkingFilter.Flush())
+
+	// If tool calling buffered text, send it now as a single chunk
+	if fullText != "" && len(simToolCalls) == 0 {
+		stream.send(map[string]any{"content": fullText})
+	}
+	return fullText, simToolCalls, nil
+}
+
+// appendSimulatedCalls converts the parsed calls into the shape the responders
+// emit.
+func appendSimulatedCalls(toolCalls []client.ToolCall, simToolCalls []toolcalling.ToolCall) []client.ToolCall {
 	for _, stc := range simToolCalls {
 		toolCalls = append(toolCalls, client.ToolCall{
 			ID:       stc.ID,
@@ -2391,58 +2565,36 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 			Function: client.ToolCallFunction{Name: stc.Name, Namespace: stc.Namespace, Arguments: string(stc.Arguments)},
 		})
 	}
+	return toolCalls
+}
 
+// streamFinishReason names why a streamed turn ended. A turn that produced
+// tool calls reports them even when it also hit the token ceiling.
+func streamFinishReason(truncated bool, toolCalls []client.ToolCall) string {
 	if len(toolCalls) > 0 {
-		if !hasContent {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-				"role":    "assistant",
-				"content": nil,
-			})
-		}
-		for i, tc := range toolCalls {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
-				"tool_calls": []map[string]any{
-					{
-						"index": i,
-						"id":    tc.ID,
-						"type":  "function",
-						"function": map[string]string{
-							"name":      tc.Function.Name,
-							"arguments": tc.Function.Arguments,
-						},
-					},
-				},
-			})
-		}
-		flusher.Flush()
+		return "tool_calls"
 	}
-
-	// Send final chunk with usage
-	finishReason := "stop"
 	if truncated {
-		finishReason = "length"
+		return "length"
 	}
-	if len(toolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-	var usage map[string]any
-	if includeUsage {
-		promptTok := countPromptTokens(messages, tools, toolChoice)
-		completionTok := countTokens(fullText) + outputProtocolTokens
-		reasoningTok := countTokens(thinkingText.String())
-		usage = map[string]any{
-			"prompt_tokens":     promptTok,
-			"completion_tokens": completionTok,
-			"reasoning_tokens":  reasoningTok,
-			"total_tokens":      promptTok + completionTok + reasoningTok,
-			"usage_source":      usageSource(),
-		}
-	}
+	return "stop"
+}
 
-	api.updateChatStreamSession(sid, cfg.OpenAIID, finalConvID, fullText, thinkingText.String(), toolCalls)
-
-	api.sendSSEDone(w, chunkID, openaiModel, finishReason, usage)
-	flusher.Flush()
+// chatStreamUsage renders the usage object when the caller asked for one.
+func chatStreamUsage(includeUsage bool, messages []payload.Message, tools []toolcalling.ToolDef, toolChoice, fullText, thinking string) map[string]any {
+	if !includeUsage {
+		return nil
+	}
+	promptTok := countPromptTokens(messages, tools, toolChoice)
+	completionTok := countTokens(fullText) + outputProtocolTokens
+	reasoningTok := countTokens(thinking)
+	return map[string]any{
+		"prompt_tokens":     promptTok,
+		"completion_tokens": completionTok,
+		"reasoning_tokens":  reasoningTok,
+		"total_tokens":      promptTok + completionTok + reasoningTok,
+		"usage_source":      usageSource(),
+	}
 }
 
 // storeSessionMapping records the conversation a session now points at.
@@ -2515,9 +2667,7 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
@@ -2532,91 +2682,24 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendUpstreamError(w, "tool execution", progressErr)
+		respText, toolCalls, finishReason, err = api.applySimulatedToolCalls(
+			toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+		)
+		if err != nil {
+			api.sendUpstreamError(w, "tool execution", err)
 			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			// M365 did not return a simulated JSON payload (e.g. it ran
-			// its own server-side tools and returned plain text). Since
-			// we discarded backend-injected toolCalls above, reset the
-			// finish reason so we don't report tool_use with no blocks.
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
 		}
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
+	respText, finishReason = cutChatAnswer(respText, finishReason, stopSequences, maxTokens)
 
-	// A stop sequence ends the answer where the caller said it ends. OpenAI
-	// reports that as the ordinary "stop", the same as an answer that ended on
-	// its own, so only the text changes.
-	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
-		respText = cut
-		finishReason = "stop"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
-		}
-	}
-
-	msg := map[string]any{
-		"role":    "assistant",
-		"content": respText,
-	}
-
-	if thinking != "" {
-		msg["reasoning_content"] = thinking
-	}
-
-	if len(toolCalls) > 0 {
-		openaiToolCalls := make([]map[string]any, len(toolCalls))
-		for i, tc := range toolCalls {
-			openaiToolCalls[i] = map[string]any{
-				"index": i,
-				"id":    tc.ID,
-				"type":  "function",
-				"function": map[string]string{
-					"name":      tc.Function.Name,
-					"arguments": tc.Function.Arguments,
-				},
-			}
-		}
-		msg["tool_calls"] = openaiToolCalls
-		if respText == "" {
-			msg["content"] = nil
-		}
-	}
+	msg := openAIAssistantMessage(respText, thinking, toolCalls)
 
 	promptTok := countPromptTokens(messages, tools, toolChoice)
 	completionTok := countTokens(respText) + outputProtocolTokens
@@ -2647,33 +2730,209 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	api.sendJSON(w, http.StatusOK, response)
 }
 
+// forgetSession drops a session's conversation binding, so the next turn does
+// not continue a conversation this one could not use.
+func (api *APIServer) forgetSession(sid string) {
+	if sid != "" {
+		api.ctxCache.Delete(sessionKeyPrefix + sid)
+	}
+}
+
+// applySimulatedToolCalls parses the simulated tool calls out of the answer in
+// the provider's own shape, and reports the text, the calls and the finish
+// reason that follow from it.
+func (api *APIServer) applySimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, noParallel bool, respText string, toolCalls []client.ToolCall) (string, []client.ToolCall, string, error) {
+	sim, err := api.checkedSimulation(provider, messages, cfg, tools, toolChoice, noParallel, respText)
+	if err != nil {
+		return "", nil, "", err
+	}
+
+	if !sim.HasPayload {
+		// M365 did not return a simulated JSON payload (e.g. it ran its own
+		// server-side tools and returned plain text). Since the backend-injected
+		// tool calls were discarded above, reset the finish reason so we do not
+		// report tool_use with no blocks.
+		return toolcalling.WithholdTransportEnvelope(respText), toolCalls, "stop", nil
+	}
+	if len(sim.ToolCalls) == 0 {
+		return sim.Content, toolCalls, "stop", nil
+	}
+	for _, pc := range sim.ToolCalls {
+		toolCalls = append(toolCalls, client.ToolCall{
+			ID:       pc.ID,
+			Type:     "function",
+			Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
+		})
+	}
+	return "", toolCalls, "tool_calls", nil
+}
+
+// cutChatAnswer applies the caller's stop sequence and max_tokens.
+//
+// A stop sequence ends the answer where the caller said it ends. OpenAI reports
+// that as the ordinary "stop", the same as an answer that ended on its own, so
+// only the text changes. max_tokens wins when it is reached first.
+func cutChatAnswer(respText, finishReason string, stopSequences []string, maxTokens int) (string, string) {
+	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
+		respText = cut
+		finishReason = "stop"
+	}
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText = truncated
+			finishReason = "length"
+		}
+	}
+	return respText, finishReason
+}
+
+// openAIAssistantMessage builds the assistant message of a chat completion. A
+// turn that produced only tool calls carries a null content, which is what the
+// OpenAI schema declares.
+func openAIAssistantMessage(respText, thinking string, toolCalls []client.ToolCall) map[string]any {
+	msg := map[string]any{
+		"role":    "assistant",
+		"content": respText,
+	}
+	if thinking != "" {
+		msg["reasoning_content"] = thinking
+	}
+	if len(toolCalls) == 0 {
+		return msg
+	}
+
+	openaiToolCalls := make([]map[string]any, len(toolCalls))
+	for i, tc := range toolCalls {
+		openaiToolCalls[i] = map[string]any{
+			"index": i,
+			"id":    tc.ID,
+			"type":  "function",
+			"function": map[string]string{
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			},
+		}
+	}
+	msg["tool_calls"] = openaiToolCalls
+	if respText == "" {
+		msg["content"] = nil
+	}
+	return msg
+}
+
 // streamAnthropicMessages streams messages in Anthropic SSE format.
 func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
-	msgID := fmt.Sprintf("msg_%s", uuid.New().String())
+	stream := &anthropicStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		msgID:   fmt.Sprintf("msg_%s", uuid.New().String()),
+		model:   anthropicModel,
+	}
+
 	// The Anthropic wire format splits usage across message_start and
 	// message_delta, so the input side is counted once here and not repeated.
-	promptTok := countPromptTokens(messages, tools, toolChoice)
+	stream.start(countPromptTokens(messages, tools, toolChoice))
 
-	// Send message_start event
-	header := map[string]any{
+	// A stop sequence can straddle two chunks, so the deltas of a directly
+	// streamed answer pass through a writer that holds back the tail which
+	// could still complete one. A tool-enabled turn is buffered whole, so it
+	// takes the trailing cut below instead.
+	stopWriter := newStopSequenceWriter(stopSequences)
+
+	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeAnthropicKeepalive(w, flusher) })
+		if !more {
+			break
+		}
+		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter, sid)
+		if step == streamLoopFailed {
+			return
+		}
+		if step == streamLoopStop {
+			break
+		}
+	}
+	if !hasTools {
+		// Whatever the writer held back belongs to the answer when no stop
+		// sequence ever arrived.
+		stream.textDelta(stopWriter.flush())
+	}
+
+	// stopWriter.matched() is empty on the tool-enabled path, where the writer
+	// never ran and the cut inside anthropicToolCalls sets it instead.
+	fullText, simToolCalls, matchedStop, err := api.anthropicToolCalls(
+		stream, messages, cfg, tools, toolChoice, stopSequences, hasTools, noParallel, stopWriter.matched(),
+	)
+	if err != nil {
+		api.sendAnthropicProgressError(w, err)
+		return
+	}
+
+	stream.closeThinkingOnlyTurn(hasTools)
+	// If tool calling buffered text, send it now as a text block
+	if hasTools && fullText != "" {
+		stream.sendTextBlock(fullText)
+	}
+	stream.closeOpenBlocks()
+
+	// Send tool_use content blocks if any (server-side tools from M365 backend
+	// or simulated)
+	toolCalls, _ := withoutBackendToolCalls(stream.backendCalls, "")
+	toolCalls = appendSimulatedCalls(toolCalls, simToolCalls)
+	stream.emitToolUseBlocks(toolCalls)
+
+	api.storeSessionMapping(sid, stream.convID)
+	stream.finish(fullText, toolCalls, matchedStop)
+}
+
+// anthropicStream carries what one Anthropic messages turn streams.
+//
+// The wire format is a sequence of indexed content blocks, so which block is
+// open and which index it carries have to survive between chunks.
+type anthropicStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	msgID   string
+	model   string
+
+	fullText       strings.Builder
+	thinking       strings.Builder
+	thinkingFilter toolcalling.ThinkingStreamFilter
+	thinkingClosed bool
+	thinkingOpen   bool
+	textOpen       bool
+	blockIndex     int
+	truncated      bool
+	convID         string
+	backendCalls   []client.ToolCall
+}
+
+// event writes one event of the stream.
+func (s *anthropicStream) event(name string, data map[string]any) {
+	s.api.sendAnthropicSSE(s.w, name, data)
+}
+
+// start writes message_start, which carries the input side of the usage.
+func (s *anthropicStream) start(promptTok int) {
+	s.event("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":            msgID,
+			"id":            s.msgID,
 			"type":          "message",
 			"role":          "assistant",
 			"content":       []any{},
-			"model":         anthropicModel,
+			"model":         s.model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
@@ -2682,273 +2941,163 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 				"usage_source":  usageSource(),
 			},
 		},
+	})
+	s.flusher.Flush()
+}
+
+// fail reports a failed turn as an error event.
+func (s *anthropicStream) fail(err error) {
+	_, code, message := streamErrorFields("message", err)
+	s.event("error", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    code,
+			"message": message,
+		},
+	})
+	s.flusher.Flush()
+}
+
+// openThinking starts the reasoning block unless it is open already.
+func (s *anthropicStream) openThinking() {
+	if s.thinkingOpen {
+		return
 	}
-	api.sendAnthropicSSE(w, "message_start", header)
-	flusher.Flush()
+	s.event("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         s.blockIndex,
+		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+	})
+	s.thinkingOpen = true
+}
 
-	// Stream content with optional thinking block
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	thinkingClosed := false
-	truncated := false
-	thinkingBlockOpen := false
-	textBlockOpen := false
-	blockIndex := 0
-	toolCallingEnabled := hasTools
-
-	// A stop sequence can straddle two chunks, so the deltas of a directly
-	// streamed answer pass through a writer that holds back the tail which
-	// could still complete one. A tool-enabled turn is buffered whole, so it
-	// takes the trailing cut below instead.
-	stopWriter := newStopSequenceWriter(stopSequences)
-	sendTextDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": text},
-		})
-		flusher.Flush()
+// thinkingDelta writes one reasoning fragment, opening the block first.
+func (s *anthropicStream) thinkingDelta(text string) {
+	if text == "" {
+		return
 	}
+	s.openThinking()
+	s.event("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": s.blockIndex,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": text},
+	})
+	s.flusher.Flush()
+}
 
-	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
-	keepalive := time.NewTicker(sseKeepaliveInterval)
-	defer keepalive.Stop()
-	for {
-		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeAnthropicKeepalive(w, flusher) })
-		if !more {
-			break
-		}
-		if chunk.Error != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			_, code, message := streamErrorFields("message", chunk.Error)
-			errEvent := map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"type":    code,
-					"message": message,
-				},
-			}
-			api.sendAnthropicSSE(w, "error", errEvent)
-			flusher.Flush()
-			return
-		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
-			break
-		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Handle thinking content
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				// Live-stream thinking through a stateful filter that strips the
-				// simulated transport envelope (fenced blocks + meta-prose) so
-				// the model's reasoning is visible without exposing the mechanism.
-				if emit := thinkingFilter.Feed(chunk.Thinking); emit != "" {
-					if !thinkingBlockOpen {
-						api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-						thinkingBlockOpen = true
-					}
-					api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": emit}})
-					flusher.Flush()
-				}
-				continue
-			}
-			if !thinkingBlockOpen {
-				cbStart := map[string]any{
-					"type":          "content_block_start",
-					"index":         blockIndex,
-					"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
-				}
-				api.sendAnthropicSSE(w, "content_block_start", cbStart)
-				thinkingBlockOpen = true
-			}
-			delta := map[string]any{
-				"type":  "content_block_delta",
-				"index": blockIndex,
-				"delta": map[string]any{"type": "thinking_delta", "thinking": chunk.Thinking},
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", delta)
-			flusher.Flush()
-			continue
-		}
-
-		// Transition from thinking to text: flush the filter remainder (tool
-		// path) then close any open thinking block before content follows.
-		if toolCallingEnabled && !thinkingClosed {
-			if rem := thinkingFilter.Flush(); rem != "" {
-				if !thinkingBlockOpen {
-					api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-					thinkingBlockOpen = true
-				}
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-			}
-			thinkingClosed = true
-		}
-		if thinkingBlockOpen && !textBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-			blockIndex++
-			thinkingBlockOpen = false
-		}
-
-		// Open text block on first text chunk (only if not buffering for tool calling)
-		if !textBlockOpen && !toolCallingEnabled {
-			cbStart := map[string]any{
-				"type":          "content_block_start",
-				"index":         blockIndex,
-				"content_block": map[string]any{"type": "text", "text": ""},
-			}
-			api.sendAnthropicSSE(w, "content_block_start", cbStart)
-			textBlockOpen = true
-		}
-
-		// Check max_tokens limit before sending more content
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// If tool calling is not enabled, stream text deltas directly. The
-		// writer decides what is safe to release, and it also feeds the
-		// accumulator, so the reported usage matches what the client received.
-		if !toolCallingEnabled {
-			emit, _ := stopWriter.next(chunk.Text)
-			sendTextDelta(emit)
-			continue
-		}
-		fullTextBuilder.WriteString(chunk.Text)
+// closeThinking ends the reasoning block and moves to the next block index.
+func (s *anthropicStream) closeThinking() {
+	if !s.thinkingOpen {
+		return
 	}
-	if !toolCallingEnabled {
-		// Whatever the writer held back belongs to the answer when no stop
-		// sequence ever arrived.
-		sendTextDelta(stopWriter.flush())
-	}
-	fullText := fullTextBuilder.String()
-	// Empty on the tool-enabled path, where the writer never ran and the cut
-	// below sets it instead.
-	matchedStop := stopWriter.matched()
+	s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+	s.blockIndex++
+	s.thinkingOpen = false
+}
 
-	// Parse simulated tool calls from full text if tool calling is enabled
-	var simToolCalls []toolcalling.ToolCall
-	if toolCallingEnabled {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, fullText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendAnthropicProgressError(w, progressErr)
-			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				simToolCalls = sim.ToolCalls
-				fullText = ""
-			} else {
-				fullText = sim.Content
-			}
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-		fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
-		// A tool-enabled turn is buffered whole and emitted below, so its stop
-		// sequence is applied here rather than through the writer.
-		if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
-			fullText = cut
-			matchedStop = matched
-		}
+// openText starts the answer block unless it is open already.
+func (s *anthropicStream) openText() {
+	if s.textOpen {
+		return
 	}
+	s.event("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         s.blockIndex,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+	s.textOpen = true
+}
 
-	// Flush any remaining filtered thinking when the response was thinking-only
-	// (no content chunk triggered the in-loop transition) and close its block.
-	if toolCallingEnabled && !thinkingClosed {
-		if rem := thinkingFilter.Flush(); rem != "" {
-			if !thinkingBlockOpen {
-				api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": blockIndex, "content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""}})
-				thinkingBlockOpen = true
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": blockIndex, "delta": map[string]any{"type": "thinking_delta", "thinking": rem}})
-		}
-		if thinkingBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-			blockIndex++
-			thinkingBlockOpen = false
-		}
+// writeTextDelta writes one answer fragment into the open block.
+func (s *anthropicStream) writeTextDelta(text string) {
+	s.event("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": s.blockIndex,
+		"delta": map[string]any{"type": "text_delta", "text": text},
+	})
+	s.flusher.Flush()
+}
+
+// textDelta writes one streamed answer fragment and records it.
+func (s *anthropicStream) textDelta(text string) {
+	if text == "" {
+		return
 	}
+	s.fullText.WriteString(text)
+	s.writeTextDelta(text)
+}
 
-	// If tool calling buffered text, send it now as a text block
-	if toolCallingEnabled && fullText != "" {
-		cbStart := map[string]any{
-			"type":          "content_block_start",
-			"index":         blockIndex,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		}
-		api.sendAnthropicSSE(w, "content_block_start", cbStart)
-		textBlockOpen = true
-		delta := map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": fullText},
-		}
-		api.sendAnthropicSSE(w, "content_block_delta", delta)
-		flusher.Flush()
+// sendTextBlock writes a buffered answer as its own block. The text was
+// accumulated as it arrived, so it is not recorded again.
+func (s *anthropicStream) sendTextBlock(text string) {
+	s.openText()
+	s.writeTextDelta(text)
+}
+
+// streamThinking emits the reasoning summary as it arrives. A tool-enabled turn
+// filters it, because the simulated transport envelope travels in the same
+// channel.
+func (s *anthropicStream) streamThinking(text string, hasTools bool) {
+	s.thinking.WriteString(text)
+	if !hasTools {
+		s.thinkingDelta(text)
+		return
 	}
+	// Live-stream thinking through a stateful filter that strips the simulated
+	// transport envelope (fenced blocks + meta-prose) so the model's reasoning
+	// is visible without exposing the mechanism.
+	s.thinkingDelta(s.thinkingFilter.Feed(text))
+}
 
-	// Close any open blocks
-	if thinkingBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-		blockIndex++
+// closeThinkingForText ends the reasoning block before answer content follows.
+// A tool-enabled turn first releases whatever its filter still holds.
+func (s *anthropicStream) closeThinkingForText(hasTools bool) {
+	if hasTools && !s.thinkingClosed {
+		s.thinkingDelta(s.thinkingFilter.Flush())
+		s.thinkingClosed = true
 	}
-	if textBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
-		blockIndex++
+	if s.thinkingOpen && !s.textOpen {
+		s.closeThinking()
 	}
+}
 
-	// Send tool_use content blocks if any (server-side tools from M365 backend or simulated)
-	toolCalls, _ := withoutBackendToolCalls(finalToolCalls, "")
-
-	// Append simulated tool calls
-	for _, stc := range simToolCalls {
-		toolCalls = append(toolCalls, client.ToolCall{
-			ID:       stc.ID,
-			Type:     "function",
-			Function: client.ToolCallFunction{Name: stc.Name, Namespace: stc.Namespace, Arguments: string(stc.Arguments)},
-		})
+// closeThinkingOnlyTurn releases the filtered reasoning of a turn that produced
+// nothing else, because no content chunk triggered the in-loop transition.
+func (s *anthropicStream) closeThinkingOnlyTurn(hasTools bool) {
+	if !hasTools || s.thinkingClosed {
+		return
 	}
+	s.thinkingDelta(s.thinkingFilter.Flush())
+	s.closeThinking()
+}
 
+// closeOpenBlocks ends whatever content block is still open.
+func (s *anthropicStream) closeOpenBlocks() {
+	if s.thinkingOpen {
+		s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+		s.blockIndex++
+	}
+	if s.textOpen {
+		s.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
+		s.blockIndex++
+	}
+}
+
+// emitToolUseBlocks writes each call as its own content block.
+//
+// Anthropic streaming delivers tool_use input as input_json_delta fragments,
+// not inside content_block_start. SDK clients (e.g. Claude Code) accumulate
+// partial_json and ignore any input in the start event, so the full arguments
+// must be sent as a delta or the client sees an empty input and loops.
+func (s *anthropicStream) emitToolUseBlocks(toolCalls []client.ToolCall) {
 	for _, tc := range toolCalls {
-		// Anthropic streaming delivers tool_use input as input_json_delta
-		// fragments, not inside content_block_start. SDK clients (e.g. Claude
-		// Code) accumulate partial_json and ignore any input in the start
-		// event, so the full arguments must be sent as a delta or the client
-		// sees an empty input and loops.
 		partialJSON := strings.TrimSpace(tc.Function.Arguments)
 		if partialJSON == "" {
 			partialJSON = "{}"
 		}
-		api.sendAnthropicSSE(w, "content_block_start", map[string]any{
+		s.event("content_block_start", map[string]any{
 			"type":  "content_block_start",
-			"index": blockIndex,
+			"index": s.blockIndex,
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
@@ -2956,28 +3105,79 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 				"input": map[string]any{},
 			},
 		})
-		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{
+		s.event("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
-			"index": blockIndex,
+			"index": s.blockIndex,
 			"delta": map[string]any{
 				"type":         "input_json_delta",
 				"partial_json": partialJSON,
 			},
 		})
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
+		s.event("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
-			"index": blockIndex,
+			"index": s.blockIndex,
 		})
-		blockIndex++
+		s.blockIndex++
 	}
-	flusher.Flush()
+	s.flusher.Flush()
+}
 
-	// Send message_delta event
+// chunk reads one upstream chunk of an Anthropic messages turn.
+func (s *anthropicStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, hasTools bool, stopWriter *stopSequenceWriter, sid string) streamLoopStep {
+	if chunk.Error != nil {
+		s.api.forgetSession(sid)
+		s.fail(chunk.Error)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		s.backendCalls = chunk.ToolCalls
+		return streamLoopStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// Handle thinking content
+	if chunk.Thinking != "" {
+		s.streamThinking(chunk.Thinking, hasTools)
+		return streamLoopContinue
+	}
+
+	// Transition from thinking to text before any content follows
+	s.closeThinkingForText(hasTools)
+
+	// Open text block on first text chunk (only if not buffering for tool calling)
+	if !hasTools {
+		s.openText()
+	}
+
+	// Check max_tokens limit before sending more content
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// If tool calling is not enabled, stream text deltas directly. The writer
+	// decides what is safe to release, and it also feeds the accumulator, so
+	// the reported usage matches what the client received.
+	if !hasTools {
+		emit, _ := stopWriter.next(chunk.Text)
+		s.textDelta(emit)
+		return streamLoopContinue
+	}
+	s.fullText.WriteString(chunk.Text)
+	return streamLoopContinue
+}
+
+// finish writes message_delta with the stop reason and the output usage, then
+// message_stop.
+func (s *anthropicStream) finish(fullText string, toolCalls []client.ToolCall, matchedStop string) {
 	stopReason := "end_turn"
 	if matchedStop != "" {
 		stopReason = "stop_sequence"
 	}
-	if truncated {
+	if s.truncated {
 		stopReason = "max_tokens"
 		matchedStop = ""
 	}
@@ -2985,7 +3185,7 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 		stopReason = "tool_use"
 		matchedStop = ""
 	}
-	msgDelta := map[string]any{
+	s.event("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
@@ -2993,38 +3193,65 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 		},
 		"usage": map[string]any{
 			"output_tokens":    countTokens(fullText) + outputProtocolTokens,
-			"reasoning_tokens": countTokens(thinkingText.String()),
+			"reasoning_tokens": countTokens(s.thinking.String()),
 			"usage_source":     usageSource(),
 		},
-	}
-	api.sendAnthropicSSE(w, "message_delta", msgDelta)
-	flusher.Flush()
+	})
+	s.flusher.Flush()
 
-	api.storeSessionMapping(sid, finalConvID)
-
-	// Send message_stop event
-	msgStop := map[string]any{"type": "message_stop"}
-	api.sendAnthropicSSE(w, "message_stop", msgStop)
-	flusher.Flush()
+	s.event("message_stop", map[string]any{"type": "message_stop"})
+	s.flusher.Flush()
 }
 
-func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model, sid string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string) {
+// anthropicToolCalls parses the simulated tool calls out of a buffered
+// tool-enabled turn. A turn with no tools streamed its text already and passes
+// through untouched, keeping the stop sequence its writer matched.
+func (api *APIServer) anthropicToolCalls(stream *anthropicStream, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, hasTools, noParallel bool, matchedStop string) (string, []toolcalling.ToolCall, string, error) {
+	fullText := stream.fullText.String()
+	if !hasTools {
+		return fullText, nil, matchedStop, nil
+	}
+
+	var simToolCalls []toolcalling.ToolCall
+	sim, err := api.checkedSimulation(toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, fullText)
+	if err != nil {
+		return "", nil, "", err
+	}
+	switch {
+	case !sim.HasPayload:
+		fullText = toolcalling.WithholdTransportEnvelope(fullText)
+		if toolcalling.IsContentPolicyBlock(fullText) {
+			// The stream is already open, so the refusal cannot be turned into
+			// an HTTP error the way the non-streaming paths do.
+			logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+		}
+	case len(sim.ToolCalls) > 0:
+		simToolCalls = sim.ToolCalls
+		fullText = ""
+	default:
+		fullText = sim.Content
+	}
+
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
+	// A tool-enabled turn is buffered whole and emitted by the caller, so its
+	// stop sequence is applied here rather than through the writer.
+	if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
+		fullText = cut
+		matchedStop = matched
+	}
+	return fullText, simToolCalls, matchedStop, nil
+}
+
+// The session's conversation is already stored by runToolLoop, so this
+// responder takes no session id.
+func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, model string, maxTokens int, stream bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string) {
 	stopReason := "end_turn"
 	if len(result.toolCalls) > 0 {
 		stopReason = "tool_use"
 	}
-	// The answer ends where the caller said it ends, and Anthropic names the
-	// sequence that ended it alongside the reason.
-	cut, matchedStop := cutAtStopSequence(result.text, stopSequences)
-	if matchedStop != "" {
-		result.text, stopReason = cut, "stop_sequence"
-	}
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
-			result.text, stopReason = truncated, "max_tokens"
-			matchedStop = ""
-		}
-	}
+	var matchedStop string
+	result.text, stopReason, matchedStop = cutAnthropicAnswer(result.text, stopReason, stopSequences, maxTokens)
+
 	content := []map[string]any{}
 	if result.text != "" {
 		content = append(content, map[string]any{"type": "text", "text": result.text})
@@ -3036,48 +3263,111 @@ func (api *APIServer) respondBufferedAnthropic(w http.ResponseWriter, result too
 		}
 		content = append(content, map[string]any{"type": "tool_use", "id": call.ID, "name": call.Function.Name, "input": input})
 	}
+
 	usage := anthropicUsage(messages, tools, toolChoice, result.text, result.thinking)
 	response := map[string]any{"id": fmt.Sprintf("msg_%s", uuid.New().String()), "type": "message", "role": "assistant", "content": content, "model": model, "stop_reason": stopReason, "stop_sequence": nullableString(matchedStop), "usage": usage}
 	if !stream {
 		api.sendJSON(w, http.StatusOK, response)
 		return
 	}
+	api.replayAnthropicSSE(w, response, content, model, usage, stopReason, matchedStop, countTokens(result.text))
+}
+
+// cutAnthropicAnswer applies the caller's stop sequence and max_tokens.
+//
+// The answer ends where the caller said it ends, and Anthropic names the
+// sequence that ended it alongside the reason. max_tokens wins when it is
+// reached first, and clears the match.
+func cutAnthropicAnswer(respText, stopReason string, stopSequences []string, maxTokens int) (string, string, string) {
+	cut, matchedStop := cutAtStopSequence(respText, stopSequences)
+	if matchedStop != "" {
+		respText, stopReason = cut, "stop_sequence"
+	}
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
+			respText, stopReason = truncated, "max_tokens"
+			matchedStop = ""
+		}
+	}
+	return respText, stopReason, matchedStop
+}
+
+// anthropicToolUseInput decodes a call's arguments for a tool_use block.
+//
+// Arguments that do not parse become an empty object rather than a missing
+// field, because a tool_use block without input is not a shape the Anthropic
+// clients accept.
+func anthropicToolUseInput(arguments string) any {
+	var input any
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil || input == nil {
+		return map[string]any{}
+	}
+	return input
+}
+
+// anthropicContentBlocks renders one answer as Anthropic content blocks, in the
+// order the protocol expects: reasoning, then text, then the tool calls.
+func anthropicContentBlocks(thinking, respText string, toolCalls []client.ToolCall) []map[string]any {
+	content := []map[string]any{}
+	if thinking != "" {
+		content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": ""})
+	}
+	if respText != "" {
+		content = append(content, map[string]any{"type": "text", "text": respText})
+	}
+	for _, tc := range toolCalls {
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    tc.ID,
+			"name":  tc.Function.Name,
+			"input": anthropicToolUseInput(tc.Function.Arguments),
+		})
+	}
+	return content
+}
+
+// replayAnthropicSSE writes an already complete answer as the Anthropic event
+// stream, which is what a streaming request whose turn was buffered receives.
+func (api *APIServer) replayAnthropicSSE(w http.ResponseWriter, response map[string]any, content []map[string]any, model string, usage map[string]any, stopReason, matchedStop string, outputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	api.sendAnthropicSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": response["id"], "type": "message", "role": "assistant", "content": []any{}, "model": model, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": 0, "usage_source": usageSource()}}})
 	for i, block := range content {
-		switch block["type"] {
-		case "tool_use":
-			// tool_use input must stream as an input_json_delta fragment, not
-			// inline in content_block_start; SDK clients accumulate partial_json
-			// and otherwise see an empty input and loop forever.
-			start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": start})
-			partial, err := json.Marshal(block["input"])
-			if err != nil || len(partial) == 0 {
-				partial = []byte("{}")
-			}
-			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
-		case "text":
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": map[string]any{"type": "text", "text": ""}})
-			if txt, _ := block["text"].(string); txt != "" {
-				api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": txt}})
-			}
-		default:
-			api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": block})
-		}
+		api.replayAnthropicBlock(w, i, block)
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nullableString(matchedStop)}, "usage": map[string]any{"output_tokens": countTokens(result.text)}})
+	api.sendAnthropicSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nullableString(matchedStop)}, "usage": map[string]any{"output_tokens": outputTokens}})
 	api.sendAnthropicSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+}
+
+// replayAnthropicBlock writes the start and the content of one block.
+func (api *APIServer) replayAnthropicBlock(w http.ResponseWriter, index int, block map[string]any) {
+	switch block["type"] {
+	case "tool_use":
+		// tool_use input must stream as an input_json_delta fragment, not
+		// inline in content_block_start; SDK clients accumulate partial_json
+		// and otherwise see an empty input and loop forever.
+		start := map[string]any{"type": "tool_use", "id": block["id"], "name": block["name"], "input": map[string]any{}}
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": start})
+		partial, err := json.Marshal(block["input"])
+		if err != nil || len(partial) == 0 {
+			partial = []byte("{}")
+		}
+		api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)}})
+	case "text":
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "text", "text": ""}})
+		if txt, _ := block["text"].(string); txt != "" {
+			api.sendAnthropicSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": txt}})
+		}
+	default:
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": block})
+	}
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
 func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
 	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
@@ -3092,36 +3382,12 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
-		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, respText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendUpstreamError(w, "tool execution", progressErr)
+		respText, toolCalls, finishReason, err = api.applySimulatedToolCalls(
+			toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+		)
+		if err != nil {
+			api.sendUpstreamError(w, "tool execution", err)
 			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			// M365 did not return a simulated JSON payload (e.g. it ran
-			// its own server-side tools and returned plain text). Since
-			// we discarded backend-injected toolCalls above, reset the
-			// finish reason so we don't report tool_use with no blocks.
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
 		}
 	}
 
@@ -3131,56 +3397,15 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
 
-	// The answer ends where the caller said it ends, and Anthropic names the
-	// sequence that ended it alongside the reason.
-	cut, matchedStop := cutAtStopSequence(respText, stopSequences)
-	if matchedStop != "" {
-		respText = cut
-		stopReason = "stop_sequence"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			stopReason = "max_tokens"
-			matchedStop = ""
-		}
-	}
-
-	content := []map[string]any{}
-	if thinking != "" {
-		content = append(content, map[string]any{"type": "thinking", "thinking": thinking, "signature": ""})
-	}
-	if respText != "" {
-		content = append(content, map[string]any{"type": "text", "text": respText})
-	}
-
-	if len(toolCalls) > 0 {
-		for _, tc := range toolCalls {
-			var input any
-			// Arguments that do not parse become an empty object rather than a
-			// missing field, because a tool_use block without input is not a
-			// shape the Anthropic clients accept.
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
-				input = map[string]any{}
-			}
-			content = append(content, map[string]any{
-				"type":  "tool_use",
-				"id":    tc.ID,
-				"name":  tc.Function.Name,
-				"input": input,
-			})
-		}
-	}
+	var matchedStop string
+	respText, stopReason, matchedStop = cutAnthropicAnswer(respText, stopReason, stopSequences, maxTokens)
+	content := anthropicContentBlocks(thinking, respText, toolCalls)
 
 	response := map[string]any{
 		"id":            fmt.Sprintf("msg_%s", uuid.New().String()),
@@ -3204,14 +3429,8 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 // streamCompletions streams text completion responses in OpenAI text_completion format.
 func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, includeUsage bool) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
@@ -3223,47 +3442,22 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	compID := fmt.Sprintf("cmpl-%s", uuid.New().String())
-	openaiModel := cfg.OpenAIID
+	stream := &completionStream{
+		api:     api,
+		w:       w,
+		flusher: flusher,
+		compID:  fmt.Sprintf("cmpl-%s", uuid.New().String()),
+		model:   cfg.OpenAIID,
+	}
 
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	var fullTextBuilder strings.Builder
-	var thinkingBuilder strings.Builder
-	truncated := false
-	toolCallingEnabled := hasTools
 
 	// A stop sequence can straddle two chunks, so the deltas of a directly
 	// streamed answer pass through a writer that holds back the tail which
 	// could still complete one. A tool-enabled turn is buffered whole, so it
 	// takes the trailing cut below instead.
 	stopWriter := newStopSequenceWriter(stopSequences)
-	sendTextDelta := func(text string) {
-		if text == "" {
-			return
-		}
-		fullTextBuilder.WriteString(text)
-		chunkData := map[string]any{
-			"id":      compID,
-			"object":  "text_completion",
-			"created": time.Now().Unix(),
-			"model":   openaiModel,
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"text":          text,
-					"finish_reason": nil,
-					"logprobs":      nil,
-				},
-			},
-		}
-		jsonData, _ := json.Marshal(chunkData)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
 
-	var finalConvID string
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -3271,152 +3465,156 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			// An error object rather than completion text, for the same reason
-			// the chat stream carries one: text would be stored as the answer.
-			status, code, message := streamErrorFields("completion", chunk.Error)
-			errChunk := map[string]any{
-				"id":      compID,
-				"object":  "text_completion",
-				"created": time.Now().Unix(),
-				"model":   openaiModel,
-				"error": map[string]any{
-					"message": message,
-					"type":    openAIErrorType(status),
-					"code":    code,
-				},
-			}
-			jsonData, _ := json.Marshal(errChunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
-			finalToolCalls = chunk.ToolCalls
+		if step == streamLoopStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Accumulate thinking text (not sent as content for text_completion)
-		if chunk.Thinking != "" {
-			thinkingBuilder.WriteString(chunk.Thinking)
-			continue
-		}
-
-		// Check max_tokens limit before sending more content
-		if maxTokens > 0 && countTokens(fullTextBuilder.String()) >= maxTokens {
-			truncated = true
-			for range ch {
-			}
-			break
-		}
-
-		// If tool calling is not enabled, stream text directly. The writer
-		// decides what is safe to release, and it also feeds the accumulator,
-		// so the reported usage matches what the client received.
-		if !toolCallingEnabled {
-			emit, _ := stopWriter.next(chunk.Text)
-			sendTextDelta(emit)
-			continue
-		}
-		fullTextBuilder.WriteString(chunk.Text)
 	}
-	if !toolCallingEnabled {
+	if !hasTools {
 		// Whatever the writer held back belongs to the answer when no stop
 		// sequence ever arrived.
-		sendTextDelta(stopWriter.flush())
-	}
-	_ = finalToolCalls
-	fullText := fullTextBuilder.String()
-
-	// Parse simulated tool calls from buffered text if tool calling is enabled
-	var simToolCalls []toolcalling.ToolCall
-	if toolCallingEnabled {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendSSEError(w, "tool execution", compID, openaiModel, progressErr, "text_completion")
-			flusher.Flush()
-			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				simToolCalls = sim.ToolCalls
-				fullText = ""
-			} else {
-				fullText = sim.Content
-			}
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-		fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
-		// A tool-enabled turn is buffered whole and emitted below, so its stop
-		// sequence is applied here rather than through the writer.
-		if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
-			fullText = cut
-		}
+		stream.delta(stopWriter.flush())
 	}
 
-	// If tool calling buffered text, send it now as a single chunk
-	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
-		chunkData := map[string]any{
-			"id":      compID,
-			"object":  "text_completion",
-			"created": time.Now().Unix(),
-			"model":   openaiModel,
-			"choices": []map[string]any{
-				{
-					"index":         0,
-					"text":          fullText,
-					"finish_reason": nil,
-					"logprobs":      nil,
-				},
-			},
-		}
-		jsonData, _ := json.Marshal(chunkData)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
+	fullText, simToolCalls, err := api.completionToolCalls(stream, messages, cfg, tools, toolChoice, stopSequences, hasTools)
+	if err != nil {
+		stream.fail(err)
+		return
 	}
 
-	// Send final done chunk
-	finishReason := "stop"
-	if truncated {
-		finishReason = "length"
-	}
-	if len(simToolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-	doneChunk := map[string]any{
-		"id":      compID,
+	api.storeSessionMapping(sid, stream.convID)
+	stream.finish(fullText, simToolCalls, messages, tools, toolChoice, includeUsage)
+}
+
+// completionStream carries what one text_completion turn streams.
+type completionStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+	compID  string
+	model   string
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+}
+
+// textChunk builds one text_completion chunk object.
+func (s *completionStream) textChunk(text string, finishReason any) map[string]any {
+	return map[string]any{
+		"id":      s.compID,
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
-		"model":   openaiModel,
+		"model":   s.model,
 		"choices": []map[string]any{
 			{
 				"index":         0,
-				"text":          "",
+				"text":          text,
 				"finish_reason": finishReason,
 				"logprobs":      nil,
 			},
 		},
 	}
+}
+
+// sendText writes one chunk without recording it, which is what a buffered
+// answer needs because it was accumulated as it arrived.
+func (s *completionStream) sendText(text string) {
+	jsonData, _ := json.Marshal(s.textChunk(text, nil))
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	s.flusher.Flush()
+}
+
+// delta writes one streamed chunk and records the text it carried.
+func (s *completionStream) delta(text string) {
+	if text == "" {
+		return
+	}
+	s.fullText.WriteString(text)
+	s.sendText(text)
+}
+
+// fail reports a failed turn as an error object rather than as completion text,
+// for the same reason the chat stream carries one: text would be stored as the
+// answer.
+func (s *completionStream) fail(err error) {
+	status, code, message := streamErrorFields("completion", err)
+	errChunk := map[string]any{
+		"id":      s.compID,
+		"object":  "text_completion",
+		"created": time.Now().Unix(),
+		"model":   s.model,
+		"error": map[string]any{
+			"message": message,
+			"type":    openAIErrorType(status),
+			"code":    code,
+		},
+	}
+	jsonData, _ := json.Marshal(errChunk)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// chunk reads one upstream chunk of a text_completion turn.
+func (s *completionStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, hasTools bool, stopWriter *stopSequenceWriter) streamLoopStep {
+	if chunk.Error != nil {
+		s.fail(chunk.Error)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return streamLoopStop
+	}
+
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
+
+	// Accumulate thinking text (not sent as content for text_completion)
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		return streamLoopContinue
+	}
+
+	// Check max_tokens limit before sending more content
+	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
+		s.truncated = true
+		drainStream(ch)
+		return streamLoopStop
+	}
+
+	// If tool calling is not enabled, stream text directly. The writer decides
+	// what is safe to release, and it also feeds the accumulator, so the
+	// reported usage matches what the client received.
+	if !hasTools {
+		emit, _ := stopWriter.next(chunk.Text)
+		s.delta(emit)
+		return streamLoopContinue
+	}
+	s.fullText.WriteString(chunk.Text)
+	return streamLoopContinue
+}
+
+// finish writes the terminating chunk with the turn's finish reason and usage.
+func (s *completionStream) finish(fullText string, simToolCalls []toolcalling.ToolCall, messages []payload.Message, tools []toolcalling.ToolDef, toolChoice string, includeUsage bool) {
+	finishReason := "stop"
+	if s.truncated {
+		finishReason = "length"
+	}
+	if len(simToolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+	doneChunk := s.textChunk("", finishReason)
+
 	// This route reported no usage at all, unlike every other streaming
 	// endpoint, so the reasoning it accumulated reached no client.
 	if includeUsage {
 		promptTok := countPromptTokens(messages, tools, toolChoice)
 		completionTok := countTokens(fullText) + outputProtocolTokens
-		reasoningTok := countTokens(thinkingBuilder.String())
+		reasoningTok := countTokens(s.thinking.String())
 		doneChunk["usage"] = map[string]any{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
@@ -3425,12 +3623,54 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 			"usage_source":      usageSource(),
 		}
 	}
-	api.storeSessionMapping(sid, finalConvID)
 
 	jsonData, _ := json.Marshal(doneChunk)
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// completionToolCalls parses the simulated tool calls out of a buffered
+// tool-enabled turn and emits whatever text is left as one chunk. A turn with
+// no tools streamed its text already and passes through untouched.
+func (api *APIServer) completionToolCalls(stream *completionStream, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, hasTools bool) (string, []toolcalling.ToolCall, error) {
+	fullText := stream.fullText.String()
+	if !hasTools {
+		return fullText, nil, nil
+	}
+
+	var simToolCalls []toolcalling.ToolCall
+	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, false, fullText)
+	if err != nil {
+		return "", nil, err
+	}
+	switch {
+	case !sim.HasPayload:
+		fullText = toolcalling.WithholdTransportEnvelope(fullText)
+		if toolcalling.IsContentPolicyBlock(fullText) {
+			// The stream is already open, so the refusal cannot be turned into
+			// an HTTP error the way the non-streaming paths do.
+			logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+		}
+	case len(sim.ToolCalls) > 0:
+		simToolCalls = sim.ToolCalls
+		fullText = ""
+	default:
+		fullText = sim.Content
+	}
+
+	fullText = replaceUnverifiedCompletionClaim(fullText, hasTools, buildToolLedger(messages), len(simToolCalls))
+	// A tool-enabled turn is buffered whole and emitted here, so its stop
+	// sequence is applied now rather than through the writer.
+	if cut, matched := cutAtStopSequence(fullText, stopSequences); matched != "" {
+		fullText = cut
+	}
+
+	// If tool calling buffered text, send it now as a single chunk
+	if fullText != "" && len(simToolCalls) == 0 {
+		stream.sendText(fullText)
+	}
+	return fullText, simToolCalls, nil
 }
 
 // nonStreamCompletions handles non-streaming text completion.
@@ -3444,61 +3684,25 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
 
-	// Parse simulated tool calls from response text
+	// Parse simulated tool calls from response text. Completions declares no
+	// parallel_tool_calls field, so parallel calls stay allowed here.
 	if hasTools {
-		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
-		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
-		if progressErr != nil {
-			api.sendUpstreamError(w, "tool execution", progressErr)
+		respText, toolCalls, finishReason, err = api.applySimulatedToolCalls(
+			toolLoopOpenAI, messages, cfg, tools, toolChoice, false, respText, toolCalls,
+		)
+		if err != nil {
+			api.sendUpstreamError(w, "tool execution", err)
 			return
-		}
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			finishReason = "stop"
-			respText = toolcalling.WithholdTransportEnvelope(respText)
 		}
 	}
 
 	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		api.sendContentBlockedError(w, respText)
 		return
 	}
 	respText = withoutUnverifiedCompletionClaim(respText, hasTools, buildToolLedger(messages), toolCalls)
-
-	// A stop sequence ends the answer where the caller said it ends. OpenAI
-	// reports that as the ordinary "stop", the same as an answer that ended on
-	// its own, so only the text changes.
-	if cut, matched := cutAtStopSequence(respText, stopSequences); matched != "" {
-		respText = cut
-		finishReason = "stop"
-	}
-
-	// Enforce max_tokens on response text
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
-		}
-	}
+	respText, finishReason = cutChatAnswer(respText, finishReason, stopSequences, maxTokens)
 
 	promptTok := countPromptTokens(messages, tools, toolChoice)
 	completionTok := countTokens(respText) + outputProtocolTokens
@@ -3551,12 +3755,62 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 }
 
 // sendJSON sends a JSON response.
+//
+// A body written here carries conversation content, a session-to-conversation
+// mapping or account data unless its own handler says otherwise, so storage is
+// refused by default. A response with no cache rule at all is worse than one
+// that refuses: RFC 9111 lets a cache assign its own freshness to a 200 that
+// declares no expiry. A handler serving cacheable data sets its rule before it
+// calls this, and that rule is kept.
 func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.WriteHeader(statusCode)
 
 	writeJSONBody(w, data)
+}
+
+// contentETag builds a strong validator from the bytes that go out. RFC 7232
+// requires the quotes, and a cache that parses the header properly ignores a
+// tag without them.
+func contentETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// sendCachedJSON sends a JSON body a caller may hold, with a strong validator
+// so a repeat request costs a 304 rather than the whole body.
+//
+// The body is marshalled once and hashed, so the tag describes the bytes that
+// go out. Only a body with no volatile field belongs here: a timestamp or an id
+// minted per request would make every tag unique and defeat the cache the tag
+// exists to serve.
+func (api *APIServer) sendCachedJSON(w http.ResponseWriter, r *http.Request, data any, cacheControl string) {
+	body, err := json.Marshal(data)
+	if err != nil {
+		logging.Errorf("cached response encode failed: %v", err)
+		api.sendError(w, http.StatusInternalServerError, "Response could not be encoded")
+		return
+	}
+	etag := contentETag(body)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("ETag", etag)
+
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(append(body, '\n')); err != nil {
+		logging.Debugf("cached response write failed: %v", err)
+	}
 }
 
 // writeJSONBody encodes the body of a response whose status line has already
@@ -4104,30 +4358,7 @@ func responsesPromptWithoutImageBytes(requestJSON string) string {
 		return requestJSON
 	}
 	index := 0
-	var visit func(any)
-	visit = func(value any) {
-		switch node := value.(type) {
-		case map[string]any:
-			kind, _ := node["type"].(string)
-			if kind == "input_image" || kind == "image_url" || kind == "image" {
-				index++
-				for key := range node {
-					delete(node, key)
-				}
-				node["type"] = "input_text"
-				node["text"] = fmt.Sprintf("[Image attachment %d is supplied separately for visual inspection.]", index)
-				return
-			}
-			for _, child := range node {
-				visit(child)
-			}
-		case []any:
-			for _, child := range node {
-				visit(child)
-			}
-		}
-	}
-	visit(request)
+	replaceResponseImages(request, &index)
 	if index == 0 {
 		return requestJSON
 	}
@@ -4136,6 +4367,29 @@ func responsesPromptWithoutImageBytes(requestJSON string) string {
 		return requestJSON
 	}
 	return string(result)
+}
+
+func replaceResponseImages(value any, index *int) {
+	switch node := value.(type) {
+	case map[string]any:
+		kind, _ := node["type"].(string)
+		if kind == "input_image" || kind == "image_url" || kind == "image" {
+			(*index)++
+			for key := range node {
+				delete(node, key)
+			}
+			node["type"] = "input_text"
+			node["text"] = fmt.Sprintf("[Image attachment %d is supplied separately for visual inspection.]", *index)
+			return
+		}
+		for _, child := range node {
+			replaceResponseImages(child, index)
+		}
+	case []any:
+		for _, child := range node {
+			replaceResponseImages(child, index)
+		}
+	}
 }
 
 // injectSimulatedPromptAnthropic replaces the last user message with a
@@ -4234,8 +4488,18 @@ func applyReasoningEffort(modelKey string, cfg models.ModelConfig, deliberate bo
 // context window legitimately sends results whose calls are no longer present.
 // Only a missing id is rejected in that case.
 func validateToolResultMessages(messages []payload.Message) error {
-	// A repeated id makes the loop ambiguous: neither the client nor this
-	// server can tell which call a later result answers.
+	known, err := declaredToolCallIDs(messages)
+	if err != nil {
+		return err
+	}
+	return validateToolResults(messages, known)
+}
+
+// declaredToolCallIDs collects the call ids this request declares.
+//
+// A repeated id makes the loop ambiguous: neither the client nor this server
+// can tell which call a later result answers.
+func declaredToolCallIDs(messages []payload.Message) (map[string]bool, error) {
 	known := make(map[string]bool)
 	for i := range messages {
 		for _, call := range messages[i].ToolCalls {
@@ -4243,29 +4507,42 @@ func validateToolResultMessages(messages []payload.Message) error {
 				continue
 			}
 			if known[call.ID] {
-				return fmt.Errorf("tool call id %q is declared more than once in this request", call.ID)
+				return nil, fmt.Errorf("tool call id %q is declared more than once in this request", call.ID)
 			}
 			known[call.ID] = true
 		}
 	}
+	return known, nil
+}
 
+// validateToolResults checks that every result answers exactly one declared
+// call.
+func validateToolResults(messages []payload.Message, known map[string]bool) error {
 	answered := make(map[string]bool)
 	for i := range messages {
 		if messages[i].Role == "tool" && messages[i].ToolCallID == "" {
 			return errors.New(`a message with role "tool" is missing tool_call_id`)
 		}
-		for _, result := range messages[i].ToolResults {
-			if result.ID == "" {
-				return errors.New("a tool result is missing the id of the tool call it answers")
-			}
-			if len(known) > 0 && !known[result.ID] {
-				return fmt.Errorf("tool result %q does not answer any tool call in this request", result.ID)
-			}
-			if answered[result.ID] {
-				return fmt.Errorf("tool call %q is answered more than once in this request", result.ID)
-			}
-			answered[result.ID] = true
+		if err := validateMessageToolResults(messages[i], known, answered); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// validateMessageToolResults checks the results one message carries.
+func validateMessageToolResults(message payload.Message, known, answered map[string]bool) error {
+	for _, result := range message.ToolResults {
+		if result.ID == "" {
+			return errors.New("a tool result is missing the id of the tool call it answers")
+		}
+		if len(known) > 0 && !known[result.ID] {
+			return fmt.Errorf("tool result %q does not answer any tool call in this request", result.ID)
+		}
+		if answered[result.ID] {
+			return fmt.Errorf("tool call %q is answered more than once in this request", result.ID)
+		}
+		answered[result.ID] = true
 	}
 	return nil
 }
@@ -4460,55 +4737,8 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 		tools:            tools,
 	}
 
-	switch choice := toolChoice.(type) {
-	case nil:
-		// Responses defaults to auto when tools are present.
-	case string:
-		normalized := strings.ToLower(strings.TrimSpace(choice))
-		switch normalized {
-		case "", "auto":
-		case "none":
-			policy.simulate = false
-			policy.promptChoice = "none"
-			policy.allowedToolNames = nil
-		case "required":
-			policy.required = true
-			policy.promptChoice = "required"
-		default:
-			if strings.EqualFold(choice, toolcalling.WebSearchToolName) {
-				// The backend performs the search itself, so the pin is
-				// satisfied by the answer rather than by a call.
-				break
-			}
-			if !knownNames[choice] {
-				return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice %q", choice)
-			}
-			policy.required = true
-			policy.requiredName = choice
-			policy.promptChoice = choice
-			policy.allowedToolNames = []string{choice}
-		}
-	case map[string]any:
-		name, _ := choice["name"].(string)
-		choiceType, _ := choice["type"].(string)
-		if name == "" {
-			if function, ok := choice["function"].(map[string]any); ok {
-				name, _ = function["name"].(string)
-			}
-		}
-		if name == "" && choiceType != "" && choiceType != "function" && choiceType != "custom" {
-			name = choiceType
-		}
-		name = strings.TrimSpace(name)
-		if name == "" || !knownNames[name] {
-			return responsesToolPolicy{}, fmt.Errorf("invalid Responses named tool_choice %q", name)
-		}
-		policy.required = true
-		policy.requiredName = name
-		policy.promptChoice = name
-		policy.allowedToolNames = []string{name}
-	default:
-		return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice type %T", toolChoice)
+	if err := policy.applyToolChoice(toolChoice, knownNames); err != nil {
+		return responsesToolPolicy{}, err
 	}
 
 	if policy.simulate && len(policy.allowedToolNames) == 0 {
@@ -4518,6 +4748,83 @@ func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice any) (respon
 		return responsesToolPolicy{}, errors.New("responses tool_choice requires at least one tool")
 	}
 	return policy, nil
+}
+
+// applyToolChoice narrows the policy to what tool_choice asked for. Responses
+// defaults to auto when tools are present, which is what a nil choice means.
+func (p *responsesToolPolicy) applyToolChoice(toolChoice any, knownNames map[string]bool) error {
+	switch choice := toolChoice.(type) {
+	case nil:
+		return nil
+	case string:
+		return p.applyStringChoice(choice, knownNames)
+	case map[string]any:
+		return p.applyNamedChoice(choice, knownNames)
+	}
+	return fmt.Errorf("invalid Responses tool_choice type %T", toolChoice)
+}
+
+// applyStringChoice reads the string form of tool_choice, which is either a
+// mode or the name of one tool.
+func (p *responsesToolPolicy) applyStringChoice(choice string, knownNames map[string]bool) error {
+	switch strings.ToLower(strings.TrimSpace(choice)) {
+	case "", "auto":
+		return nil
+	case "none":
+		p.simulate = false
+		p.promptChoice = "none"
+		p.allowedToolNames = nil
+		return nil
+	case "required":
+		p.required = true
+		p.promptChoice = "required"
+		return nil
+	}
+
+	if strings.EqualFold(choice, toolcalling.WebSearchToolName) {
+		// The backend performs the search itself, so the pin is satisfied by
+		// the answer rather than by a call.
+		return nil
+	}
+	if !knownNames[choice] {
+		return fmt.Errorf("invalid Responses tool_choice %q", choice)
+	}
+	p.pinTo(choice)
+	return nil
+}
+
+// applyNamedChoice reads the object form of tool_choice.
+func (p *responsesToolPolicy) applyNamedChoice(choice map[string]any, knownNames map[string]bool) error {
+	name := responsesChoiceName(choice)
+	if name == "" || !knownNames[name] {
+		return fmt.Errorf("invalid Responses named tool_choice %q", name)
+	}
+	p.pinTo(name)
+	return nil
+}
+
+// responsesChoiceName reads the tool name out of an object tool_choice, which
+// carries it under any of three keys depending on the client.
+func responsesChoiceName(choice map[string]any) string {
+	name, _ := choice["name"].(string)
+	choiceType, _ := choice["type"].(string)
+	if name == "" {
+		if function, ok := choice["function"].(map[string]any); ok {
+			name, _ = function["name"].(string)
+		}
+	}
+	if name == "" && choiceType != "" && choiceType != "function" && choiceType != "custom" {
+		name = choiceType
+	}
+	return strings.TrimSpace(name)
+}
+
+// pinTo requires the named tool and hides every other one from the prompt.
+func (p *responsesToolPolicy) pinTo(name string) {
+	p.required = true
+	p.requiredName = name
+	p.promptChoice = name
+	p.allowedToolNames = []string{name}
 }
 
 func responsesToolName(tool toolcalling.ToolDef) string {
@@ -4596,48 +4903,61 @@ func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []too
 		if !ok {
 			continue
 		}
-		toolType, _ := tool["type"].(string)
-		if toolType == "namespace" {
-			namespace, _ := tool["name"].(string)
-			if namespace == "" {
-				namespace = inheritedNamespace
-			}
-			definitions = append(
-				definitions,
-				responsesToolDefsFromRawNamespace(tool["tools"], namespace)...,
-			)
+		if toolType, _ := tool["type"].(string); toolType == "namespace" {
+			definitions = append(definitions, expandToolNamespace(tool, inheritedNamespace)...)
 			continue
 		}
-		name, _ := tool["name"].(string)
-		if name == "" && toolType != "" && toolType != "function" && toolType != "custom" {
-			name = toolType
-		}
-		if name == "" {
+		definition, ok := responsesToolDefFromRaw(tool, inheritedNamespace)
+		if !ok {
 			continue
-		}
-		namespace, _ := tool["namespace"].(string)
-		if namespace == "" {
-			namespace = inheritedNamespace
-		}
-		description, _ := tool["description"].(string)
-		definition := toolcalling.ToolDef{
-			Type:        toolType,
-			Name:        name,
-			Namespace:   namespace,
-			Description: description,
-		}
-		if parameters, ok := tool["parameters"].(map[string]any); ok {
-			definition.Parameters = parameters
-		}
-		if inputSchema, ok := tool["input_schema"].(map[string]any); ok {
-			definition.InputSchema = inputSchema
-		}
-		if nestedTools, ok := tool["tools"].([]any); ok {
-			definition.Tools = responsesToolDefsFromRawNamespace(nestedTools, namespace)
 		}
 		definitions = append(definitions, definition)
 	}
 	return definitions
+}
+
+// expandToolNamespace flattens a namespace entry, whose own name scopes every
+// tool it holds.
+func expandToolNamespace(tool map[string]any, inheritedNamespace string) []toolcalling.ToolDef {
+	namespace, _ := tool["name"].(string)
+	if namespace == "" {
+		namespace = inheritedNamespace
+	}
+	return responsesToolDefsFromRawNamespace(tool["tools"], namespace)
+}
+
+// responsesToolDefFromRaw reads one tool declaration. A declaration with no
+// usable name is not a tool this gateway can route a call to.
+func responsesToolDefFromRaw(tool map[string]any, inheritedNamespace string) (toolcalling.ToolDef, bool) {
+	toolType, _ := tool["type"].(string)
+	name, _ := tool["name"].(string)
+	if name == "" && toolType != "" && toolType != "function" && toolType != "custom" {
+		name = toolType
+	}
+	if name == "" {
+		return toolcalling.ToolDef{}, false
+	}
+	namespace, _ := tool["namespace"].(string)
+	if namespace == "" {
+		namespace = inheritedNamespace
+	}
+	description, _ := tool["description"].(string)
+	definition := toolcalling.ToolDef{
+		Type:        toolType,
+		Name:        name,
+		Namespace:   namespace,
+		Description: description,
+	}
+	if parameters, ok := tool["parameters"].(map[string]any); ok {
+		definition.Parameters = parameters
+	}
+	if inputSchema, ok := tool["input_schema"].(map[string]any); ok {
+		definition.InputSchema = inputSchema
+	}
+	if nestedTools, ok := tool["tools"].([]any); ok {
+		definition.Tools = responsesToolDefsFromRawNamespace(nestedTools, namespace)
+	}
+	return definition, true
 }
 
 func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcalling.ToolDef {
@@ -4661,15 +4981,23 @@ func mergeLoadedResponsesTools(input any, tools []toolcalling.ToolDef) []toolcal
 		if itemType != "tool_search_output" && itemType != "additional_tools" {
 			continue
 		}
-		for _, tool := range responsesToolDefsFromRaw(record["tools"]) {
-			name := responsesToolName(tool)
-			key := responsesToolKey(tool.Namespace, name)
-			if name == "" || seen[key] {
-				continue
-			}
-			seen[key] = true
-			tools = append(tools, tool)
+		tools = appendUnseenTools(tools, responsesToolDefsFromRaw(record["tools"]), seen)
+	}
+	return tools
+}
+
+// appendUnseenTools adds the declarations this request has not already seen,
+// keyed by namespace and name so two tools of the same name in different
+// namespaces both survive.
+func appendUnseenTools(tools, loaded []toolcalling.ToolDef, seen map[string]bool) []toolcalling.ToolDef {
+	for _, tool := range loaded {
+		name := responsesToolName(tool)
+		key := responsesToolKey(tool.Namespace, name)
+		if name == "" || seen[key] {
+			continue
 		}
+		seen[key] = true
+		tools = append(tools, tool)
 	}
 	return tools
 }
@@ -4821,24 +5149,7 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		finishReason: "stop",
 	}
 	simulated := toolcalling.ParseSimulatedResponseResponses(text, policy.allowedToolNames, toolcalling.ContractsFor(policy.tools).WithoutParallel(policy.noParallel))
-	// A grammar tool's body arrives unfenced, either as the lone bridge
-	// envelope or as bare source. It may be the whole reply, or it may end up
-	// as the extracted content of an otherwise valid envelope; either way it
-	// would reach the client as escaped source in an assistant message instead
-	// of a call. The candidate is whatever text is about to be forwarded.
-	if len(simulated.ToolCalls) == 0 {
-		candidate := text
-		if simulated.HasPayload {
-			candidate = simulated.Content
-		}
-		if call, ok := toolcalling.GrammarBodyCall(candidate, policy.tools, policy.allows); ok {
-			logging.Infof("parseResponsesSimulation: claimed an unfenced grammar body as a %q call", call.Name)
-			simulated.HasPayload = true
-			simulated.FinishReason = "tool_calls"
-			simulated.Content = ""
-			simulated.ToolCalls = []toolcalling.ToolCall{call}
-		}
-	}
+	simulated = claimGrammarBodyCall(text, simulated, policy)
 	if !policy.required {
 		if !simulated.HasPayload {
 			simulated.Content = toolcalling.WithholdTransportEnvelope(text)
@@ -4853,38 +5164,81 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		result.content = simulated.Content
 		if len(simulated.ToolCalls) > 0 {
 			result.finishReason = "tool_calls"
-			for _, parsed := range simulated.ToolCalls {
-				namespace, ok := resolveResponsesToolNamespace(
-					parsed.Name,
-					parsed.Namespace,
-					policy.tools,
-				)
-				if !ok {
-					continue
-				}
-				result.toolCalls = append(result.toolCalls, client.ToolCall{
-					ID:   parsed.ID,
-					Type: "function",
-					Function: client.ToolCallFunction{
-						Name:      parsed.Name,
-						Namespace: namespace,
-						Arguments: string(parsed.Arguments),
-					},
-				})
-			}
+			result.toolCalls = responsesToolCallsFrom(simulated.ToolCalls, policy)
 		}
 	}
 	if len(result.toolCalls) > 0 && strings.TrimSpace(result.content) == "" {
 		result.content = "I'm using the relevant tool now and will continue with its result."
 	}
 
-	if policy.required && len(result.toolCalls) == 0 {
-		if policy.requiredName != "" {
-			return responsesSimulationResult{}, fmt.Errorf("%w: required tool %q was not emitted", errSimulatedToolCallRequired, policy.requiredName)
-		}
-		return responsesSimulationResult{}, fmt.Errorf("%w: no valid client tool call was emitted", errSimulatedToolCallRequired)
+	if err := policy.requireEmittedCall(result.toolCalls); err != nil {
+		return responsesSimulationResult{}, err
 	}
 	return result, nil
+}
+
+// claimGrammarBodyCall claims an unfenced grammar tool body as a call.
+//
+// A grammar tool's body arrives unfenced, either as the lone bridge envelope or
+// as bare source. It may be the whole reply, or it may end up as the extracted
+// content of an otherwise valid envelope; either way it would reach the client
+// as escaped source in an assistant message instead of a call. The candidate is
+// whatever text is about to be forwarded.
+func claimGrammarBodyCall(text string, simulated toolcalling.SimulatedResult, policy responsesToolPolicy) toolcalling.SimulatedResult {
+	if len(simulated.ToolCalls) > 0 {
+		return simulated
+	}
+	candidate := text
+	if simulated.HasPayload {
+		candidate = simulated.Content
+	}
+	call, ok := toolcalling.GrammarBodyCall(candidate, policy.tools, policy.allows)
+	if !ok {
+		return simulated
+	}
+	logging.Infof("parseResponsesSimulation: claimed an unfenced grammar body as a %q call", call.Name)
+	simulated.HasPayload = true
+	simulated.FinishReason = "tool_calls"
+	simulated.Content = ""
+	simulated.ToolCalls = []toolcalling.ToolCall{call}
+	return simulated
+}
+
+// responsesToolCallsFrom resolves each parsed call's namespace and drops the
+// ones that name no declared tool.
+func responsesToolCallsFrom(parsedCalls []toolcalling.ToolCall, policy responsesToolPolicy) []client.ToolCall {
+	var calls []client.ToolCall
+	for _, parsed := range parsedCalls {
+		namespace, ok := resolveResponsesToolNamespace(
+			parsed.Name,
+			parsed.Namespace,
+			policy.tools,
+		)
+		if !ok {
+			continue
+		}
+		calls = append(calls, client.ToolCall{
+			ID:   parsed.ID,
+			Type: "function",
+			Function: client.ToolCallFunction{
+				Name:      parsed.Name,
+				Namespace: namespace,
+				Arguments: string(parsed.Arguments),
+			},
+		})
+	}
+	return calls
+}
+
+// requireEmittedCall enforces a tool_choice that demanded a call.
+func (p responsesToolPolicy) requireEmittedCall(toolCalls []client.ToolCall) error {
+	if !p.required || len(toolCalls) > 0 {
+		return nil
+	}
+	if p.requiredName != "" {
+		return fmt.Errorf("%w: required tool %q was not emitted", errSimulatedToolCallRequired, p.requiredName)
+	}
+	return fmt.Errorf("%w: no valid client tool call was emitted", errSimulatedToolCallRequired)
 }
 
 func parseResponsesSimulationWithRetry(
@@ -4895,24 +5249,44 @@ func parseResponsesSimulationWithRetry(
 ) (responsesSimulationResult, error) {
 	result, err := parseResponsesSimulation(text, policy)
 	if err == nil {
-		if emptyRetry == nil ||
-			!responsesResultEmpty(result.content, result.toolCalls) {
-			return result, nil
-		}
-		retryText, retryErr := emptyRetry()
-		if retryErr != nil {
-			return responsesSimulationResult{}, fmt.Errorf(
-				"empty simulated response retry failed: %w",
-				retryErr,
-			)
-		}
-		return parseResponsesSimulation(retryText, policy)
+		return retryEmptyResponsesSimulation(result, policy, emptyRetry)
 	}
 	if requiredRetry == nil ||
 		!retryableSimulationFailure(err) {
 		return result, err
 	}
+	return retryRequiredResponsesSimulation(result, err, policy, requiredRetry)
+}
 
+// retryEmptyResponsesSimulation asks again when the turn parsed cleanly but
+// carried neither content nor a call.
+func retryEmptyResponsesSimulation(
+	result responsesSimulationResult,
+	policy responsesToolPolicy,
+	emptyRetry func() (string, error),
+) (responsesSimulationResult, error) {
+	if emptyRetry == nil ||
+		!responsesResultEmpty(result.content, result.toolCalls) {
+		return result, nil
+	}
+	retryText, retryErr := emptyRetry()
+	if retryErr != nil {
+		return responsesSimulationResult{}, fmt.Errorf(
+			"empty simulated response retry failed: %w",
+			retryErr,
+		)
+	}
+	return parseResponsesSimulation(retryText, policy)
+}
+
+// retryRequiredResponsesSimulation asks again when tool_choice demanded a call
+// the model did not emit. Two further attempts, then the failure stands.
+func retryRequiredResponsesSimulation(
+	result responsesSimulationResult,
+	err error,
+	policy responsesToolPolicy,
+	requiredRetry func() (string, error),
+) (responsesSimulationResult, error) {
 	for range 2 {
 		retryText, retryErr := requiredRetry()
 		if retryErr != nil {
@@ -5080,66 +5454,97 @@ func responsesStreamWithEmptyRetry(
 		}
 
 		for attempt := 0; ; attempt++ {
-			stream := call(ctx, conversationID)
-			sawVisibleChunk := false
-			sawFinal := false
-
-			for chunk := range stream {
-				if chunk.Error != nil {
-					emit(chunk)
-					return
-				}
-				if chunk.IsFinal {
-					sawFinal = true
-					if sawVisibleChunk || attempt >= len(retryDelays) {
-						emit(chunk)
-						return
-					}
-					break
-				}
-				if simulatedTransport {
-					// Simulated prompts can put the transport envelope in the
-					// upstream thinking channel. The Responses handler only
-					// needs raw text for its safe content extractor.
-					chunk.Thinking = ""
-				}
-				if chunk.Text == "" && chunk.Thinking == "" {
-					continue
-				}
-				sawVisibleChunk = true
-				if !emit(chunk) {
-					return
-				}
+			result := forwardResponsesAttempt(
+				call(ctx, conversationID),
+				emit,
+				simulatedTransport,
+				attempt >= len(retryDelays),
+			)
+			if result.stop {
+				return
 			}
-
-			if !sawFinal {
+			if !result.sawFinal {
 				if ctx.Err() == nil {
 					emit(client.StreamChunk{Error: client.ErrConnectionClosed})
 				}
 				return
 			}
-			if attempt >= len(retryDelays) {
-				return
-			}
-
-			logging.Warnf(
-				"Responses upstream stream completed empty; retrying attempt=%d/%d",
-				attempt+2,
-				len(retryDelays)+1,
-			)
-			if onRetry != nil {
-				onRetry()
-			}
-			if err := waitForResponsesEmptyRetry(
-				ctx,
-				retryDelays[attempt],
-			); err != nil {
+			if !prepareResponsesRetry(ctx, attempt, retryDelays, onRetry) {
 				return
 			}
 			conversationID = ""
 		}
 	}()
 	return output
+}
+
+// responsesAttempt is what one upstream attempt produced.
+type responsesAttempt struct {
+	// sawVisibleChunk records that the caller received answer content.
+	sawVisibleChunk bool
+	// sawFinal records that the upstream turn ended rather than the connection.
+	sawFinal bool
+	// stop means nothing further is owed to the caller.
+	stop bool
+}
+
+// visibleChunk reports whether a chunk carries anything the caller can show.
+func visibleChunk(chunk client.StreamChunk) bool {
+	return chunk.Text != "" || chunk.Thinking != ""
+}
+
+// forwardResponsesAttempt forwards one upstream attempt to the caller.
+//
+// lastAttempt makes an empty turn terminal rather than a reason to retry.
+func forwardResponsesAttempt(stream <-chan client.StreamChunk, emit func(client.StreamChunk) bool, simulatedTransport, lastAttempt bool) responsesAttempt {
+	var result responsesAttempt
+	for chunk := range stream {
+		if chunk.Error != nil {
+			emit(chunk)
+			result.stop = true
+			return result
+		}
+		if chunk.IsFinal {
+			result.sawFinal = true
+			if result.sawVisibleChunk || lastAttempt {
+				emit(chunk)
+				result.stop = true
+			}
+			return result
+		}
+		if simulatedTransport {
+			// Simulated prompts can put the transport envelope in the upstream
+			// thinking channel. The Responses handler only needs raw text for
+			// its safe content extractor.
+			chunk.Thinking = ""
+		}
+		if !visibleChunk(chunk) {
+			continue
+		}
+		result.sawVisibleChunk = true
+		if !emit(chunk) {
+			result.stop = true
+			return result
+		}
+	}
+	return result
+}
+
+// prepareResponsesRetry logs the retry, tells the caller it is happening and
+// waits out the backoff. It reports false when the turn must end instead.
+func prepareResponsesRetry(ctx context.Context, attempt int, retryDelays []time.Duration, onRetry func()) bool {
+	if attempt >= len(retryDelays) {
+		return false
+	}
+	logging.Warnf(
+		"Responses upstream stream completed empty; retrying attempt=%d/%d",
+		attempt+2,
+		len(retryDelays)+1,
+	)
+	if onRetry != nil {
+		onRetry()
+	}
+	return waitForResponsesEmptyRetry(ctx, retryDelays[attempt]) == nil
 }
 
 // newResponsesIdentity mints the id and the creation time of one Responses
@@ -5516,26 +5921,9 @@ type responsesReasoning struct {
 
 // handleResponses handles OpenAI Responses API requests.
 func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
 	var req responsesRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	bodyBytes, ok := api.readJSONRequest(w, r, &req, "handleResponses")
+	if !ok {
 		return
 	}
 
@@ -5548,63 +5936,33 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
-	cfg, ok := api.resolveModel(w, modelKey)
+	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
 	}
 
-	deliberate, err := reasoningEffortRequestsDeliberation(req.Reasoning)
-	if err != nil {
-		logging.Errorf("handleResponses: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
+	toolPolicy, localTools, ok := api.responsesToolSetup(w, &req)
+	if !ok {
 		return
 	}
-	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
-
-	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
-	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
-	req.Tools = preparedTools
-	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
-	if err != nil {
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	toolPolicy.noParallel = refusesParallelToolCalls(req.ParallelToolCalls)
 	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
 
 	// Convert Responses API input to payload.Message list
 	messages := responsesInputToMessages(req.Input)
 
-	// Codex CLI opens a provider with a reachability probe: a POST carrying no
-	// input at all. Answer it here rather than sending an empty turn upstream,
-	// which costs a round trip and one message of the conversation quota.
-	if strings.TrimSpace(req.Instructions) == "" && responsesInputIsEmpty(messages) {
-		api.respondResponsesProbe(w, cfg.OpenAIID, req.Stream)
+	if api.answeredResponsesProbe(w, req, cfg, messages) {
 		return
 	}
 
-	if err := validateToolResultMessages(messages); err != nil {
-		logging.Errorf("handleResponses: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ledger := buildToolLedger(messages)
-	if api.exceededToolRoundLimit(ledger) {
-		api.sendToolRoundLimitError(w, ledger)
+	ledger, ok := api.prepareToolLedger(w, messages, "handleResponses")
+	if !ok {
 		return
 	}
 	// The simulation prompt collapses the input into one message, so the
 	// evidence has to travel with the policy to reach the parser.
 	toolPolicy.ledger = ledger
 
-	// Prepend instructions as first user message (M365 has no system role)
-	if strings.TrimSpace(req.Instructions) != "" && len(messages) > 0 {
-		instrMsg := payload.Message{
-			Role:    "user",
-			Content: "Instructions: " + strings.TrimSpace(req.Instructions),
-		}
-		messages = append([]payload.Message{instrMsg}, messages...)
-	}
+	messages = prependResponsesInstructions(messages, req.Instructions)
 
 	// Inject one Responses-aware simulation prompt unless tool_choice disables
 	// client tool use.
@@ -5612,20 +5970,12 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		injectSimulatedPromptResponses(&messages, requestJSON, toolPolicy.promptChoice, toolPolicy.ledger.EvidenceNote())
 	}
 
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:        modelSessionID,
 		PreviousResponseID: req.PreviousResponseID,
 		BodySessionID:      req.SessionID,
 		BodyUser:           req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, messages)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -5635,51 +5985,100 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	goalOpen := responsesGoalContinuationOpen(req.Input)
 
 	if len(localTools) > 0 {
-		result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, sid, convID, req.Tools, toolPolicy.noParallel, localTools)
-		if err != nil {
-			api.sendUpstreamError(w, "response", err)
-			return
-		}
-		api.respondBufferedResponses(
-			w,
-			result,
-			messages,
-			cfg,
-			sid,
-			req.MaxOutputTokens,
-			req.Stream,
-			responsesToolTypes(toolPolicy.tools),
-			goalOpen,
-			toolPolicy.tools,
-			toolPolicy.promptChoice,
-		)
+		api.runResponsesToolLoop(w, r, req, messages, cfg, sid, convID, toolPolicy, localTools, goalOpen)
 		return
 	}
-	if req.Stream {
-		api.streamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-			goalOpen,
-		)
-	} else {
-		api.nonStreamResponses(
-			r.Context(),
-			w,
-			messages,
-			cfg,
-			sid,
-			convID,
-			req.MaxOutputTokens,
-			toolPolicy,
-			goalOpen,
-		)
+	api.dispatchResponses(r.Context(), w, messages, cfg, sid, convID, req.MaxOutputTokens, req.Stream, toolPolicy, goalOpen)
+}
+
+// answeredResponsesProbe answers Codex CLI's reachability probe, which is a
+// POST carrying no input at all. Answering it here avoids a round trip and one
+// message of the conversation quota.
+func (api *APIServer) answeredResponsesProbe(w http.ResponseWriter, req responsesRequest, cfg models.ModelConfig, messages []payload.Message) bool {
+	if strings.TrimSpace(req.Instructions) != "" || !responsesInputIsEmpty(messages) {
+		return false
 	}
+	api.respondResponsesProbe(w, cfg.OpenAIID, req.Stream)
+	return true
+}
+
+// dispatchResponses routes a Responses turn to the streaming or the buffered
+// responder.
+func (api *APIServer) dispatchResponses(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxOutputTokens int, stream bool, toolPolicy responsesToolPolicy, goalOpen bool) {
+	if stream {
+		api.streamResponses(ctx, w, messages, cfg, sid, convID, maxOutputTokens, toolPolicy, goalOpen)
+		return
+	}
+	api.nonStreamResponses(ctx, w, messages, cfg, sid, convID, maxOutputTokens, toolPolicy, goalOpen)
+}
+
+// responsesModelConfig resolves the model and applies the reasoning effort the
+// request asked for. ok is false when the request has already been answered.
+func (api *APIServer) responsesModelConfig(w http.ResponseWriter, modelKey string, reasoning *responsesReasoning) (models.ModelConfig, bool) {
+	cfg, ok := api.resolveModel(w, modelKey)
+	if !ok {
+		return models.ModelConfig{}, false
+	}
+	deliberate, err := reasoningEffortRequestsDeliberation(reasoning)
+	if err != nil {
+		logging.Errorf("handleResponses: %v", err)
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return models.ModelConfig{}, false
+	}
+	return applyReasoningEffort(modelKey, cfg, deliberate), true
+}
+
+// responsesToolSetup merges the loaded tools, separates the built-in ones and
+// builds the request's tool policy. ok is false when the request has already
+// been answered.
+func (api *APIServer) responsesToolSetup(w http.ResponseWriter, req *responsesRequest) (responsesToolPolicy, map[string]bool, bool) {
+	req.Tools = mergeLoadedResponsesTools(req.Input, req.Tools)
+	preparedTools, localTools := api.prepareCodingTools(req.Tools, false)
+	req.Tools = preparedTools
+
+	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return responsesToolPolicy{}, nil, false
+	}
+	toolPolicy.noParallel = refusesParallelToolCalls(req.ParallelToolCalls)
+	return toolPolicy, localTools, true
+}
+
+// prependResponsesInstructions puts the instructions first as a user message,
+// because M365 has no system role.
+func prependResponsesInstructions(messages []payload.Message, instructions string) []payload.Message {
+	trimmed := strings.TrimSpace(instructions)
+	if trimmed == "" || len(messages) == 0 {
+		return messages
+	}
+	instrMsg := payload.Message{
+		Role:    "user",
+		Content: "Instructions: " + trimmed,
+	}
+	return append([]payload.Message{instrMsg}, messages...)
+}
+
+// runResponsesToolLoop runs the built-in coding tool loop for a Responses
+// request, which answers whole because the loop takes several turns.
+func (api *APIServer) runResponsesToolLoop(w http.ResponseWriter, r *http.Request, req responsesRequest, messages []payload.Message, cfg models.ModelConfig, sid, convID string, toolPolicy responsesToolPolicy, localTools map[string]bool, goalOpen bool) {
+	result, err := api.runToolLoop(r, toolLoopOpenAI, messages, cfg, sid, convID, req.Tools, toolPolicy.noParallel, localTools)
+	if err != nil {
+		api.sendUpstreamError(w, "response", err)
+		return
+	}
+	api.respondBufferedResponses(
+		w,
+		result,
+		messages,
+		cfg,
+		req.MaxOutputTokens,
+		req.Stream,
+		responsesToolTypes(toolPolicy.tools),
+		goalOpen,
+		toolPolicy.tools,
+		toolPolicy.promptChoice,
+	)
 }
 
 // responsesToolOutputMessage preserves text, call identity and image attachments.
@@ -5732,136 +6131,145 @@ func responsesInputToMessages(input any) []payload.Message {
 		if !ok {
 			continue
 		}
-
-		itemType, _ := m["type"].(string)
-		if itemType == "compaction_trigger" {
-			continue
+		if message, ok := responsesInputItem(m); ok {
+			messages = append(messages, message)
 		}
-
-		// Handle function_call_output items (tool results). A custom tool
-		// reports its result the same way, only under its own item type and
-		// with the free-form field name.
-		if itemType == "custom_tool_call_output" {
-			messages = append(messages, responsesToolOutputMessage(m))
-			continue
-		}
-
-		if itemType == "custom_tool_call" {
-			name, _ := m["name"].(string)
-			input, _ := m["input"].(string)
-			callID, _ := m["call_id"].(string)
-			messages = append(messages, payload.Message{
-				Role:      "assistant",
-				Content:   fmt.Sprintf("Tool call: %s(%s)", name, input),
-				ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: name, Arguments: input}},
-			})
-			continue
-		}
-
-		// A long-running client tool can report intermediate progress before it
-		// has a result. The item is transport metadata: it must reach the model
-		// as context but must never satisfy the pending call, or the loop would
-		// continue on an unfinished tool.
-		if itemType == "function_call_progress" {
-			callID, _ := m["call_id"].(string)
-			message, _ := m["message"].(string)
-			if strings.TrimSpace(callID) == "" || strings.TrimSpace(message) == "" {
-				logging.Debugf("responsesInputToMessages: dropping a function_call_progress item without call_id or message")
-				continue
-			}
-			phase, _ := m["phase"].(string)
-			if phase == "" {
-				phase = "running"
-			}
-			text := fmt.Sprintf("[Tool Progress (call_id: %s, phase: %s)]\n%s", callID, phase, message)
-			if output, _ := m["output"].(string); output != "" {
-				text += "\n" + output
-			}
-			// The role stays "user": a "tool" role would be flattened and
-			// counted as a result by the history and the evidence ledger.
-			messages = append(messages, payload.Message{Role: "user", Content: text, ToolProgress: true})
-			continue
-		}
-
-		if itemType == "function_call_output" {
-			messages = append(messages, responsesToolOutputMessage(m))
-			continue
-		}
-
-		// Handle function_call items (assistant tool calls in input history)
-		if itemType == "function_call" {
-			name, _ := m["name"].(string)
-			namespace, _ := m["namespace"].(string)
-			args, _ := m["arguments"].(string)
-			callID, _ := m["call_id"].(string)
-			qualifiedName := name
-			if namespace != "" {
-				qualifiedName = namespace + "/" + name
-			}
-			messages = append(messages, payload.Message{
-				Role:      "assistant",
-				Content:   fmt.Sprintf("Tool call: %s(%s)", qualifiedName, args),
-				ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: qualifiedName, Arguments: args}},
-			})
-			continue
-		}
-
-		// Handle reasoning items (skip, M365 generates its own)
-		if itemType == "reasoning" {
-			continue
-		}
-
-		if itemType == "tool_search_call" {
-			arguments, _ := json.Marshal(m["arguments"])
-			messages = append(messages, payload.Message{
-				Role:    "assistant",
-				Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
-			})
-			continue
-		}
-
-		if itemType == "tool_search_output" {
-			toolsJSON, _ := json.Marshal(m["tools"])
-			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON),
-			})
-			continue
-		}
-
-		if itemType == "additional_tools" {
-			toolsJSON, _ := json.Marshal(m["tools"])
-			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
-			})
-			continue
-		}
-
-		if itemType == "compaction" {
-			summary, _ := m["encrypted_content"].(string)
-			if strings.TrimSpace(summary) != "" {
-				messages = append(messages, payload.Message{
-					Role:    "user",
-					Content: "Summary of the earlier conversation:\n" + summary,
-				})
-			}
-			continue
-		}
-
-		// Message items (type "message" or items with role)
-		role, _ := m["role"].(string)
-		if role == "" {
-			role = "user"
-		}
-
-		messages = append(messages, responsesContentMessage(role, m["content"]))
 	}
 
 	if len(messages) == 0 {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 	return messages
+}
+
+// responsesInputItem converts one input item. An item type that contributes
+// nothing to the turn reports false.
+func responsesInputItem(m map[string]any) (payload.Message, bool) {
+	itemType, _ := m["type"].(string)
+	switch itemType {
+	case "compaction_trigger", "reasoning":
+		// A compaction trigger is a request rather than history, and M365
+		// generates its own reasoning.
+		return payload.Message{}, false
+	case "custom_tool_call_output", "function_call_output":
+		// A custom tool reports its result the same way as a function, only
+		// under its own item type.
+		return responsesToolOutputMessage(m), true
+	case "custom_tool_call":
+		return responsesCustomToolCallMessage(m), true
+	case "function_call_progress":
+		return responsesToolProgressMessage(m)
+	case "function_call":
+		return responsesFunctionCallMessage(m), true
+	case "tool_search_call":
+		return responsesToolSearchCallMessage(m), true
+	case "tool_search_output", "additional_tools":
+		return responsesLoadedToolsMessage(itemType, m), true
+	case "compaction":
+		return responsesCompactionMessage(m)
+	}
+	return responsesPlainMessage(m), true
+}
+
+// responsesCustomToolCallMessage reads a custom tool call out of the history.
+func responsesCustomToolCallMessage(m map[string]any) payload.Message {
+	name, _ := m["name"].(string)
+	input, _ := m["input"].(string)
+	callID, _ := m["call_id"].(string)
+	return payload.Message{
+		Role:      "assistant",
+		Content:   fmt.Sprintf("Tool call: %s(%s)", name, input),
+		ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: name, Arguments: input}},
+	}
+}
+
+// responsesToolProgressMessage reads an intermediate progress report.
+//
+// A long-running client tool can report progress before it has a result. The
+// item is transport metadata: it must reach the model as context but must never
+// satisfy the pending call, or the loop would continue on an unfinished tool.
+func responsesToolProgressMessage(m map[string]any) (payload.Message, bool) {
+	callID, _ := m["call_id"].(string)
+	message, _ := m["message"].(string)
+	if strings.TrimSpace(callID) == "" || strings.TrimSpace(message) == "" {
+		logging.Debugf("responsesInputToMessages: dropping a function_call_progress item without call_id or message")
+		return payload.Message{}, false
+	}
+	phase, _ := m["phase"].(string)
+	if phase == "" {
+		phase = "running"
+	}
+	text := fmt.Sprintf("[Tool Progress (call_id: %s, phase: %s)]\n%s", callID, phase, message)
+	if output, _ := m["output"].(string); output != "" {
+		text += "\n" + output
+	}
+	// The role stays "user": a "tool" role would be flattened and counted as a
+	// result by the history and the evidence ledger.
+	return payload.Message{Role: "user", Content: text, ToolProgress: true}, true
+}
+
+// responsesFunctionCallMessage reads an assistant tool call out of the history.
+func responsesFunctionCallMessage(m map[string]any) payload.Message {
+	name, _ := m["name"].(string)
+	namespace, _ := m["namespace"].(string)
+	args, _ := m["arguments"].(string)
+	callID, _ := m["call_id"].(string)
+	qualifiedName := name
+	if namespace != "" {
+		qualifiedName = namespace + "/" + name
+	}
+	return payload.Message{
+		Role:      "assistant",
+		Content:   fmt.Sprintf("Tool call: %s(%s)", qualifiedName, args),
+		ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: qualifiedName, Arguments: args}},
+	}
+}
+
+// responsesToolSearchCallMessage reads a tool_search call out of the history.
+func responsesToolSearchCallMessage(m map[string]any) payload.Message {
+	arguments, _ := json.Marshal(m["arguments"])
+	return payload.Message{
+		Role:    "assistant",
+		Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
+	}
+}
+
+// responsesLoadedToolsMessage preserves the tools a search or an explicit list
+// loaded, with the namespace and schema the client declared.
+func responsesLoadedToolsMessage(itemType string, m map[string]any) payload.Message {
+	toolsJSON, _ := json.Marshal(m["tools"])
+	if itemType == "additional_tools" {
+		return payload.Message{
+			Role:    "tool",
+			Content: "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
+		}
+	}
+	return payload.Message{
+		Role:    "tool",
+		Content: "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON),
+	}
+}
+
+// responsesCompactionMessage reads a compaction summary of the earlier turns.
+func responsesCompactionMessage(m map[string]any) (payload.Message, bool) {
+	summary, _ := m["encrypted_content"].(string)
+	if strings.TrimSpace(summary) == "" {
+		return payload.Message{}, false
+	}
+	return payload.Message{
+		Role:    "user",
+		Content: "Summary of the earlier conversation:\n" + summary,
+	}, true
+}
+
+// responsesPlainMessage reads a message item, which is any item that carries a
+// role rather than one of the tool item types.
+func responsesPlainMessage(m map[string]any) payload.Message {
+	role, _ := m["role"].(string)
+	if role == "" {
+		role = "user"
+	}
+	return responsesContentMessage(role, m["content"])
 }
 
 func responsesInputHasCompactionTrigger(input any) bool {
@@ -5908,9 +6316,20 @@ func responsesGoalContinuationOpen(input any) bool {
 		return false
 	}
 
-	// Follow-up instructions do not silently close an unfinished goal. The
-	// client's acknowledged completion/blocker/cancellation or explicit user
-	// cancellation closes it; a newer goal marker starts a fresh goal scope.
+	goalItem := latestGoalMarkerItem(items)
+	if goalItem < 0 {
+		return false
+	}
+
+	rest := items[goalItem+1:]
+	return !goalClosedAfter(rest, updateGoalCallIDs(rest))
+}
+
+// latestGoalMarkerItem reports the index of the user item that opened the goal.
+//
+// A later ordinary user instruction retains an unfinished goal. Explicit
+// cancellation closes it, and a newer marker starts a fresh goal scope.
+func latestGoalMarkerItem(items []any) int {
 	goalItem := -1
 	for index, item := range items {
 		record, ok := item.(map[string]any)
@@ -5923,13 +6342,14 @@ func responsesGoalContinuationOpen(input any) bool {
 			goalItem = -1
 		}
 	}
-	if goalItem < 0 {
-		return false
-	}
+	return goalItem
+}
 
-	rest := items[goalItem+1:]
+// updateGoalCallIDs collects the ids of the update_goal calls made since the
+// goal opened, so their outputs can be told apart from every other tool result.
+func updateGoalCallIDs(items []any) map[string]bool {
 	updateGoalCalls := map[string]bool{}
-	for _, item := range rest {
+	for _, item := range items {
 		record, ok := item.(map[string]any)
 		if !ok {
 			continue
@@ -5945,8 +6365,13 @@ func responsesGoalContinuationOpen(input any) bool {
 			updateGoalCalls[callID] = true
 		}
 	}
+	return updateGoalCalls
+}
 
-	for _, item := range rest {
+// goalClosedAfter reports whether one of the update_goal outputs closed the
+// goal, which it does with a status of complete or blocked.
+func goalClosedAfter(items []any, updateGoalCalls map[string]bool) bool {
+	for _, item := range items {
 		record, ok := item.(map[string]any)
 		if !ok {
 			continue
@@ -5960,20 +6385,29 @@ func responsesGoalContinuationOpen(input any) bool {
 		if !updateGoalCalls[callID] {
 			continue
 		}
-		output, _ := record["output"].(string)
-		var report struct {
-			Goal struct {
-				Status string `json:"status"`
-			} `json:"goal"`
-		}
-		if json.Unmarshal([]byte(output), &report) != nil {
-			continue
-		}
-		if report.Goal.Status == "complete" || report.Goal.Status == "blocked" || report.Goal.Status == "cancelled" || report.Goal.Status == "canceled" {
-			return false
+		if goalReportCloses(record["output"]) {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// goalReportCloses reads the status out of one update_goal output.
+func goalReportCloses(rawOutput any) bool {
+	output, _ := rawOutput.(string)
+	var report struct {
+		Goal struct {
+			Status string `json:"status"`
+		} `json:"goal"`
+	}
+	if json.Unmarshal([]byte(output), &report) != nil {
+		return false
+	}
+	switch report.Goal.Status {
+	case "complete", "blocked", "cancelled", "canceled":
+		return true
+	}
+	return false
 }
 
 // responsesMessagePhase names the phase of an assistant message item. A turn
@@ -6060,17 +6494,13 @@ func (api *APIServer) respondResponsesProbe(w http.ResponseWriter, model string,
 
 	if !stream {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		writeJSONBody(w, response)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
@@ -6168,7 +6598,9 @@ func buildResponsesObject(responseID string, createdAt int64, model, text, think
 	return resp
 }
 
-func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, stream bool, toolTypes map[string]string, goalOpen bool, tools []toolcalling.ToolDef, toolChoice string) {
+// The session's conversation is already stored by runToolLoop, so this
+// responder takes no session id.
+func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result toolLoopResult, messages []payload.Message, cfg models.ModelConfig, maxTokens int, stream bool, toolTypes map[string]string, goalOpen bool, tools []toolcalling.ToolDef, toolChoice string) {
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(result.text, maxTokens); ok {
 			result.text, result.finishReason = truncated, "length"
@@ -6278,168 +6710,162 @@ func (api *APIServer) nonStreamResponses(
 		cfg,
 		convID,
 		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-		},
+		func() { api.forgetSession(sid) },
 	)
 	if err != nil {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
+		api.forgetSession(sid)
 		if api.responsesRequestCanceled(ctx, sid) {
 			return
 		}
 		api.sendUpstreamError(w, "chat", err)
 		return
 	}
-	respText := api.routeGeneratedImages(result.text)
-	thinking := result.thinking
-	toolCalls := result.toolCalls
-	finishReason := result.finishReason
-	finalConvID := result.conversationID
 
-	toolCalls, finishReason = withoutBackendToolCalls(toolCalls, finishReason)
+	turn := responsesTurn{
+		text:         api.routeGeneratedImages(result.text),
+		thinking:     result.thinking,
+		toolCalls:    result.toolCalls,
+		finishReason: result.finishReason,
+		convID:       result.conversationID,
+	}
+	turn.toolCalls, turn.finishReason = withoutBackendToolCalls(turn.toolCalls, turn.finishReason)
 
 	// Parse simulated tool calls from response text
-	if toolPolicy.simulate {
-		simulated, parseErr := parseResponsesSimulationWithRetry(
-			respText,
-			toolPolicy,
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = retryResult.toolCalls
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				respText = retryResult.text
-				thinking = retryResult.thinking
-				toolCalls = nil
-				finishReason = retryResult.finishReason
-				finalConvID = retryResult.conversationID
-				return retryResult.text, nil
-			},
-		)
-		if parseErr != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if isProgressFailure(parseErr) {
-				api.sendUpstreamError(w, "tool execution", parseErr)
-			} else if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				writeResponsesSimulationError(
-					w,
-					false,
-					"",
-					0,
-					cfg.OpenAIID,
-					parseErr,
-				)
-			} else {
-				writeResponsesServerError(
-					w,
-					false,
-					"",
-					0,
-					cfg.OpenAIID,
-					"upstream_error",
-					parseErr.Error(),
-				)
-			}
-			return
-		}
-		respText = simulated.content
-		toolCalls = simulated.toolCalls
-		finishReason = simulated.finishReason
+	if toolPolicy.simulate && !api.applyResponsesSimulation(ctx, w, &turn, messages, cfg, sid, toolPolicy) {
+		return
 	}
-	thinking = responsesReasoningForOutput(thinking, toolPolicy.simulate)
-	if blockedByContentPolicy(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		api.sendContentBlockedError(w, respText)
+
+	turn.thinking = responsesReasoningForOutput(turn.thinking, toolPolicy.simulate)
+	if blockedByContentPolicy(turn.text, turn.toolCalls) {
+		api.forgetSession(sid)
+		api.sendContentBlockedError(w, turn.text)
 		return
 	}
 	// The Responses input is collapsed into one prompt message, so the
 	// evidence comes from the policy rather than from the messages here.
-	respText = withoutUnverifiedCompletionClaim(respText, toolPolicy.simulate, toolPolicy.ledger, toolCalls)
-	if responsesResultEmpty(respText, toolCalls) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		// An exhausted conversation quota is the one empty-response cause the
-		// client can act on, so report it as 429 rather than a generic empty.
-		if api.quotaExhausted() {
-			api.sendThrottledError(w)
-			return
-		}
-		writeResponsesUpstreamEmptyError(
-			w,
-			false,
-			"",
-			0,
-			cfg.OpenAIID,
-		)
+	turn.text = withoutUnverifiedCompletionClaim(turn.text, toolPolicy.simulate, toolPolicy.ledger, turn.toolCalls)
+	if responsesResultEmpty(turn.text, turn.toolCalls) {
+		api.forgetSession(sid)
+		api.answerResponsesEmpty(w, cfg)
 		return
 	}
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-			finishReason = "length"
+		if truncated, ok := truncateToTokens(turn.text, maxTokens); ok {
+			turn.text = truncated
+			turn.finishReason = "length"
 		}
 	}
 
 	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
-	completionTok := countTokens(respText) + outputProtocolTokens
-	reasoningTok := countTokens(thinking)
+	completionTok := countTokens(turn.text) + outputProtocolTokens
+	reasoningTok := countTokens(turn.thinking)
 
 	responseID, createdAt := newResponsesIdentity()
-	response := buildResponsesObject(responseID, createdAt, cfg.OpenAIID, respText, thinking, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
+	response := buildResponsesObject(responseID, createdAt, cfg.OpenAIID, turn.text, turn.thinking, turn.toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, turn.finishReason, promptTok, completionTok, reasoningTok)
 
-	if sid != "" {
-		if shouldResetResponsesSession(respText, toolCalls, nil) {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		} else {
-			api.storeSessionMapping(sid, finalConvID)
-		}
-	}
-
+	api.storeResponsesSession(sid, turn)
 	api.sendJSON(w, http.StatusOK, response)
+}
+
+// responsesTurn carries the answer of one Responses turn, which a retry can
+// replace wholesale.
+type responsesTurn struct {
+	text         string
+	thinking     string
+	toolCalls    []client.ToolCall
+	finishReason string
+	convID       string
+}
+
+// retryResponsesTurn runs a fresh turn on a new conversation and adopts its
+// answer. dropToolCalls covers the empty-answer retry, where the calls of the
+// turn being replaced must not survive it.
+func (api *APIServer) retryResponsesTurn(ctx context.Context, turn *responsesTurn, messages []payload.Message, cfg models.ModelConfig, sid string, dropToolCalls bool) (string, error) {
+	api.forgetSession(sid)
+	retryResult, retryErr := api.responsesConversationOnce(ctx, messages, cfg, "", true)
+	if retryErr != nil {
+		return "", retryErr
+	}
+	turn.text = retryResult.text
+	turn.thinking = retryResult.thinking
+	turn.toolCalls = retryResult.toolCalls
+	if dropToolCalls {
+		turn.toolCalls = nil
+	}
+	turn.finishReason = retryResult.finishReason
+	turn.convID = retryResult.conversationID
+	return retryResult.text, nil
+}
+
+// applyResponsesSimulation parses the simulated tool calls, re-asking the
+// backend when the model owed a call it did not make or answered with nothing.
+// ok is false when the request has already been answered.
+func (api *APIServer) applyResponsesSimulation(ctx context.Context, w http.ResponseWriter, turn *responsesTurn, messages []payload.Message, cfg models.ModelConfig, sid string, toolPolicy responsesToolPolicy) bool {
+	simulated, parseErr := parseResponsesSimulationWithRetry(
+		turn.text,
+		toolPolicy,
+		func() (string, error) {
+			return api.retryResponsesTurn(ctx, turn, responsesSimulationRetryMessages(messages, toolPolicy), cfg, sid, false)
+		},
+		func() (string, error) {
+			return api.retryResponsesTurn(ctx, turn, messages, cfg, sid, true)
+		},
+	)
+	if parseErr != nil {
+		api.forgetSession(sid)
+		if api.responsesRequestCanceled(ctx, sid) {
+			return false
+		}
+		writeResponsesParseError(w, cfg.OpenAIID, parseErr)
+		return false
+	}
+	turn.text = simulated.content
+	turn.toolCalls = simulated.toolCalls
+	turn.finishReason = simulated.finishReason
+	return true
+}
+
+// writeResponsesParseError reports a simulation that could not be parsed. A
+// required call the model never made has its own code, because a client can
+// act on that one.
+func writeResponsesParseError(w http.ResponseWriter, model string, parseErr error) {
+	if isProgressFailure(parseErr) {
+		api := &APIServer{}
+		api.sendUpstreamError(w, "tool execution", parseErr)
+		return
+	}
+	if errors.Is(parseErr, errSimulatedToolCallRequired) {
+		writeResponsesSimulationError(w, false, "", 0, model, parseErr)
+		return
+	}
+	writeResponsesServerError(w, false, "", 0, model, "upstream_error", parseErr.Error())
+}
+
+// answerResponsesEmpty reports a turn that produced nothing.
+//
+// An exhausted conversation quota is the one empty-response cause the client
+// can act on, so it is reported as 429 rather than as a generic empty answer.
+func (api *APIServer) answerResponsesEmpty(w http.ResponseWriter, cfg models.ModelConfig) {
+	if api.quotaExhausted() {
+		api.sendThrottledError(w)
+		return
+	}
+	writeResponsesUpstreamEmptyError(w, false, "", 0, cfg.OpenAIID)
+}
+
+// storeResponsesSession binds the session to the conversation this turn ran on,
+// or drops the binding when the turn produced nothing worth continuing.
+func (api *APIServer) storeResponsesSession(sid string, turn responsesTurn) {
+	if sid == "" {
+		return
+	}
+	if shouldResetResponsesSession(turn.text, turn.toolCalls, nil) {
+		api.ctxCache.Delete(sessionKeyPrefix + sid)
+		return
+	}
+	api.storeSessionMapping(sid, turn.convID)
 }
 
 // streamResponses handles streaming Responses API requests.
@@ -6453,54 +6879,29 @@ func (api *APIServer) streamResponses(
 	toolPolicy responsesToolPolicy,
 	goalOpen bool,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
 	responseID, createdAt := newResponsesIdentity()
-	openaiModel := cfg.OpenAIID
-
-	// Helper to send a Responses SSE event
-	sequenceNumber := 0
-	sendEvent := func(eventType string, data map[string]any) {
-		data["type"] = eventType
-		data["sequence_number"] = sequenceNumber
-		sequenceNumber++
-		jsonData, _ := json.Marshal(data)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
-	sendFailed := func(code, message string) {
-		event := buildResponsesFailedEvent(
-			responseID,
-			createdAt,
-			openaiModel,
-			code,
-			message,
-			sequenceNumber,
-		)
-		sequenceNumber++
-		jsonData, _ := json.Marshal(event)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+	stream := &responsesStream{
+		api:         api,
+		w:           w,
+		flusher:     flusher,
+		responseID:  responseID,
+		createdAt:   createdAt,
+		model:       cfg.OpenAIID,
+		msgID:       fmt.Sprintf("msg_%s", responseID),
+		reasoningID: fmt.Sprintf("rs_%s", responseID),
 	}
 
-	// Send response.created event
-	sendEvent("response.created", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
+	// Send response.created and response.in_progress events
+	stream.event("response.created", map[string]any{
+		"response": responsesStatusObject(responseID, stream.model, "in_progress", createdAt),
 	})
-
-	// Send response.in_progress event
-	sendEvent("response.in_progress", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
+	stream.event("response.in_progress", map[string]any{
+		"response": responsesStatusObject(responseID, stream.model, "in_progress", createdAt),
 	})
 
 	ch := responsesStreamWithEmptyRetry(
@@ -6508,11 +6909,7 @@ func (api *APIServer) streamResponses(
 		convID,
 		responsesEmptyRetrySchedule(toolPolicy.simulate),
 		toolPolicy.simulate,
-		func() {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-		},
+		func() { api.forgetSession(sid) },
 		func(
 			callContext context.Context,
 			callConversationID string,
@@ -6530,109 +6927,6 @@ func (api *APIServer) streamResponses(
 		},
 	)
 
-	var fullTextBuilder strings.Builder
-	var thinkingText strings.Builder
-	truncated := false
-
-	// When tool calling is enabled, buffer all text and parse at the end
-	toolCallingEnabled := toolPolicy.simulate
-	var contentExtractor toolcalling.ContentStreamExtractor
-
-	// Track whether we've emitted the message output item
-	messageItemEmitted := false
-	reasoningItemEmitted := false
-	messageOutputIndex := 0
-	msgID := fmt.Sprintf("msg_%s", responseID)
-	reasoningID := fmt.Sprintf("rs_%s", responseID)
-	simulatedPublishedText := ""
-	emitSimulatedDelta := func(delta string) {
-		delta, published, limited := limitResponsesStreamDelta(
-			simulatedPublishedText,
-			delta,
-			maxTokens,
-		)
-		simulatedPublishedText = published
-		if limited {
-			truncated = true
-		}
-		if delta == "" {
-			return
-		}
-		if !messageItemEmitted {
-			outputIdx := 0
-			if reasoningItemEmitted {
-				outputIdx = 1
-			}
-			messageOutputIndex = outputIdx
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":      msgID,
-					"type":    "message",
-					"status":  "in_progress",
-					"role":    "assistant",
-					"phase":   "commentary",
-					"content": []any{},
-				},
-			})
-			sendEvent("response.content_part.added", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        "",
-					"annotations": []any{},
-				},
-			})
-			messageItemEmitted = true
-		}
-		sendEvent("response.output_text.delta", map[string]any{
-			"item_id":       msgID,
-			"output_index":  messageOutputIndex,
-			"content_index": 0,
-			"delta":         delta,
-		})
-	}
-
-	// Reasoning is streamed live; under simulated tool calling it passes through
-	// thinkingFilter first so the transport envelope never leaks. reasoningEmitted
-	// accumulates exactly what was published for the terminal done events.
-	var thinkingFilter toolcalling.ThinkingStreamFilter
-	var reasoningEmitted strings.Builder
-	reasoningFlushed := false
-	emitReasoning := func(delta string) {
-		if delta == "" {
-			return
-		}
-		reasoningEmitted.WriteString(delta)
-		if !reasoningItemEmitted {
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": 0,
-				"item": map[string]any{
-					"id":      reasoningID,
-					"type":    "reasoning",
-					"status":  "in_progress",
-					"summary": []map[string]any{{"type": "summary_text", "text": ""}},
-				},
-			})
-			sendEvent("response.reasoning_summary_part.added", map[string]any{
-				"item_id":       reasoningID,
-				"output_index":  0,
-				"summary_index": 0,
-				"part":          map[string]any{"type": "summary_text", "text": ""},
-			})
-			reasoningItemEmitted = true
-		}
-		sendEvent("response.reasoning_summary_text.delta", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"delta":         delta,
-		})
-	}
-
-	var finalConvID string
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -6640,466 +6934,613 @@ func (api *APIServer) streamResponses(
 		if !more {
 			break
 		}
-		if chunk.Error != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			_, code, message := streamErrorFields("responses", chunk.Error)
-			sendFailed(code, message)
+		step := stream.chunk(chunk, ch, maxTokens, toolPolicy.simulate, goalOpen, sid)
+		if step == streamLoopFailed {
 			return
 		}
-
-		if chunk.IsFinal {
-			finalConvID = chunk.ConversationID
+		if step == streamLoopStop {
 			break
 		}
-
-		chunk.Text = api.routeGeneratedImages(chunk.Text)
-
-		// Stream reasoning live. Under simulated tool calling it is filtered so
-		// the transport envelope never leaks; otherwise it passes through raw.
-		if chunk.Thinking != "" {
-			thinkingText.WriteString(chunk.Thinking)
-			if toolCallingEnabled {
-				emitReasoning(thinkingFilter.Feed(chunk.Thinking))
-			} else {
-				emitReasoning(chunk.Thinking)
-			}
-		}
-
-		// Handle text content
-		if chunk.Text != "" {
-			if toolCallingEnabled {
-				// Flush remaining reasoning before content so the reasoning item
-				// is fully emitted at output_index 0 ahead of the message item.
-				if !reasoningFlushed {
-					emitReasoning(thinkingFilter.Flush())
-					reasoningFlushed = true
-				}
-				// Keep the raw transport for final tool-call parsing, while
-				// publishing only decoded assistant content.
-				fullTextBuilder.WriteString(chunk.Text)
-				emitSimulatedDelta(contentExtractor.Feed(chunk.Text))
-			} else {
-				if !messageItemEmitted {
-					// Emit message output item
-					outputIdx := 0
-					if reasoningItemEmitted {
-						outputIdx = 1
-					}
-					sendEvent("response.output_item.added", map[string]any{
-						"output_index": outputIdx,
-						"item": map[string]any{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
-							// No tool call is known yet; the terminal item below names
-							// the phase again once the turn is parsed.
-							"phase":   responsesMessagePhase(goalOpen, nil),
-							"content": []any{},
-						},
-					})
-					sendEvent("response.content_part.added", map[string]any{
-						"item_id":       msgID,
-						"output_index":  outputIdx,
-						"content_index": 0,
-						"part": map[string]any{
-							"type":        "output_text",
-							"text":        "",
-							"annotations": []any{},
-						},
-					})
-					messageItemEmitted = true
-				}
-
-				// Check max_tokens
-				if maxTokens > 0 && countTokens(fullTextBuilder.String()+chunk.Text) > maxTokens {
-					remaining := maxTokens - countTokens(fullTextBuilder.String())
-					if remaining > 0 {
-						delta, _ := truncateToTokens(chunk.Text, remaining)
-						if delta != "" {
-							fullTextBuilder.WriteString(delta)
-							outputIdx := 0
-							if reasoningItemEmitted {
-								outputIdx = 1
-							}
-							sendEvent("response.output_text.delta", map[string]any{
-								"item_id":       msgID,
-								"output_index":  outputIdx,
-								"content_index": 0,
-								"delta":         delta,
-							})
-						}
-					}
-					truncated = true
-					// Drain remaining chunks
-					go func() {
-						for range ch {
-						}
-					}()
-					break
-				}
-
-				fullTextBuilder.WriteString(chunk.Text)
-				outputIdx := 0
-				if reasoningItemEmitted {
-					outputIdx = 1
-				}
-				sendEvent("response.output_text.delta", map[string]any{
-					"item_id":       msgID,
-					"output_index":  outputIdx,
-					"content_index": 0,
-					"delta":         chunk.Text,
-				})
-			}
-		}
 	}
-	fullText := fullTextBuilder.String()
+
+	fullText := stream.fullText.String()
 	if api.responsesRequestCanceled(ctx, sid) {
 		return
 	}
+	if !api.responsesStreamProducedContent(stream, sid, toolPolicy.simulate, fullText) {
+		return
+	}
+	stream.finalizeReasoning(toolPolicy.simulate)
 
-	if !toolCallingEnabled && responsesResultEmpty(fullText, nil) {
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
-		sendFailed(
-			upstreamEmptyResponseCode,
-			"The upstream completed without assistant content or a tool call.",
-		)
+	fullText, toolCalls, finishReason, ok := api.finishResponsesStream(
+		ctx, stream, messages, cfg, sid, maxTokens, toolPolicy, goalOpen, fullText,
+	)
+	if !ok {
+		return
+	}
+	api.completeResponsesStream(stream, messages, toolPolicy, goalOpen, fullText, toolCalls, finishReason, sid)
+}
+
+// responsesStream carries what one Responses turn streams.
+//
+// The wire format is a numbered sequence of output items, so the sequence
+// number, which items were opened and the index each one sits at all have to
+// survive between chunks.
+type responsesStream struct {
+	api     *APIServer
+	w       http.ResponseWriter
+	flusher http.Flusher
+
+	responseID  string
+	createdAt   int64
+	model       string
+	msgID       string
+	reasoningID string
+
+	sequenceNumber int
+
+	fullText  strings.Builder
+	thinking  strings.Builder
+	truncated bool
+	convID    string
+
+	// contentExtractor decodes assistant content out of the transport envelope
+	// while the raw text is kept for the final tool-call parse.
+	contentExtractor toolcalling.ContentStreamExtractor
+	// thinkingFilter strips the transport envelope out of the reasoning
+	// channel, and reasoningEmitted accumulates exactly what was published.
+	thinkingFilter   toolcalling.ThinkingStreamFilter
+	reasoningEmitted strings.Builder
+	reasoningFlushed bool
+
+	messageItemEmitted   bool
+	reasoningItemEmitted bool
+	messageOutputIndex   int
+	publishedText        string
+}
+
+// event writes one Responses SSE event, numbering it in order.
+func (s *responsesStream) event(eventType string, data map[string]any) {
+	data["type"] = eventType
+	data["sequence_number"] = s.sequenceNumber
+	s.sequenceNumber++
+	jsonData, _ := json.Marshal(data)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	s.flusher.Flush()
+}
+
+// failed reports a failed turn and ends the stream.
+func (s *responsesStream) failed(code, message string) {
+	event := buildResponsesFailedEvent(
+		s.responseID,
+		s.createdAt,
+		s.model,
+		code,
+		message,
+		s.sequenceNumber,
+	)
+	s.sequenceNumber++
+	jsonData, _ := json.Marshal(event)
+	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprint(s.w, "data: [DONE]\n\n")
+	s.flusher.Flush()
+}
+
+// failParse reports a simulation that could not be parsed. A required call the
+// model never made has its own code, because a client can act on that one.
+func (s *responsesStream) failParse(parseErr error) {
+	if isProgressFailure(parseErr) {
+		_, code := classifyUpstreamError(parseErr)
+		s.failed(code, upstreamErrorMessage("tool execution", code))
+		return
+	}
+	if errors.Is(parseErr, errSimulatedToolCallRequired) {
+		s.failed(simulatedToolCallRequiredCode, parseErr.Error())
+		return
+	}
+	s.failed("upstream_error", parseErr.Error())
+}
+
+// outputIndexAfterReasoning returns the item index that follows the reasoning
+// item, which occupies index 0 whenever it exists.
+func (s *responsesStream) outputIndexAfterReasoning() int {
+	if s.reasoningItemEmitted {
+		return 1
+	}
+	return 0
+}
+
+// openMessageItem announces the assistant message item and its content part.
+func (s *responsesStream) openMessageItem(outputIdx int, phase string) {
+	s.messageOutputIndex = outputIdx
+	s.event("response.output_item.added", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":      s.msgID,
+			"type":    "message",
+			"status":  "in_progress",
+			"role":    "assistant",
+			"phase":   phase,
+			"content": []any{},
+		},
+	})
+	s.event("response.content_part.added", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []any{},
+		},
+	})
+	s.messageItemEmitted = true
+}
+
+// textDelta publishes one fragment of the assistant message.
+func (s *responsesStream) textDelta(outputIdx int, delta string) {
+	s.event("response.output_text.delta", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"delta":         delta,
+	})
+}
+
+// emitSimulatedDelta publishes decoded assistant content under the token
+// ceiling, opening the message item on the first delta that survives it.
+func (s *responsesStream) emitSimulatedDelta(delta string, maxTokens int) {
+	delta, published, limited := limitResponsesStreamDelta(
+		s.publishedText,
+		delta,
+		maxTokens,
+	)
+	s.publishedText = published
+	if limited {
+		s.truncated = true
+	}
+	if delta == "" {
+		return
+	}
+	if !s.messageItemEmitted {
+		s.openMessageItem(s.outputIndexAfterReasoning(), "commentary")
+	}
+	s.textDelta(s.messageOutputIndex, delta)
+}
+
+// emitReasoning publishes one fragment of the reasoning summary, opening the
+// reasoning item on the first one.
+func (s *responsesStream) emitReasoning(delta string) {
+	if delta == "" {
+		return
+	}
+	s.reasoningEmitted.WriteString(delta)
+	if !s.reasoningItemEmitted {
+		s.event("response.output_item.added", map[string]any{
+			"output_index": 0,
+			"item": map[string]any{
+				"id":      s.reasoningID,
+				"type":    "reasoning",
+				"status":  "in_progress",
+				"summary": []map[string]any{{"type": "summary_text", "text": ""}},
+			},
+		})
+		s.event("response.reasoning_summary_part.added", map[string]any{
+			"item_id":       s.reasoningID,
+			"output_index":  0,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
+		})
+		s.reasoningItemEmitted = true
+	}
+	s.event("response.reasoning_summary_text.delta", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"delta":         delta,
+	})
+}
+
+// finalizeReasoning releases whatever reasoning is still held and closes the
+// reasoning item.
+//
+// The flush covers the thinking-only case, where no content chunk triggered the
+// in-loop one. reasoningEmitted holds exactly what was published: raw text on
+// the plain path, filtered text under simulated tool calling.
+func (s *responsesStream) finalizeReasoning(simulate bool) {
+	if simulate && !s.reasoningFlushed {
+		s.emitReasoning(s.thinkingFilter.Flush())
+	}
+	if !s.reasoningItemEmitted {
 		return
 	}
 
-	// Flush any remaining filtered reasoning for the thinking-only case where no
-	// content chunk triggered the in-loop flush.
-	if toolCallingEnabled && !reasoningFlushed {
-		emitReasoning(thinkingFilter.Flush())
-	}
-
-	// Finalize reasoning item if emitted. reasoningEmitted holds exactly what was
-	// published (raw for non-simulated, filtered under simulated tool calling).
-	if reasoningItemEmitted {
-		reasoningFinal := reasoningEmitted.String()
-		sendEvent("response.reasoning_summary_text.done", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"text":          reasoningFinal,
-		})
-		sendEvent("response.reasoning_summary_part.done", map[string]any{
-			"item_id":       reasoningID,
-			"output_index":  0,
-			"summary_index": 0,
-			"part": map[string]any{
-				"type": "summary_text",
-				"text": reasoningFinal,
-			},
-		})
-		sendEvent("response.output_item.done", map[string]any{
-			"output_index": 0,
-			"item": map[string]any{
-				"id":     reasoningID,
-				"type":   "reasoning",
-				"status": "completed",
-				"summary": []map[string]any{
-					{
-						"type": "summary_text",
-						"text": reasoningFinal,
-					},
+	reasoningFinal := s.reasoningEmitted.String()
+	s.event("response.reasoning_summary_text.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"text":          reasoningFinal,
+	})
+	s.event("response.reasoning_summary_part.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  0,
+		"summary_index": 0,
+		"part": map[string]any{
+			"type": "summary_text",
+			"text": reasoningFinal,
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": 0,
+		"item": map[string]any{
+			"id":     s.reasoningID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": reasoningFinal,
 				},
 			},
-		})
+		},
+	})
+}
+
+// chunk reads one upstream chunk of a Responses turn.
+func (s *responsesStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChunk, maxTokens int, simulate, goalOpen bool, sid string) streamLoopStep {
+	if chunk.Error != nil {
+		s.api.forgetSession(sid)
+		_, code, message := streamErrorFields("responses", chunk.Error)
+		s.failed(code, message)
+		return streamLoopFailed
+	}
+	if chunk.IsFinal {
+		s.convID = chunk.ConversationID
+		return streamLoopStop
 	}
 
-	// Handle tool calling: parse buffered text for simulated tool calls
-	var toolCalls []client.ToolCall
-	finishReason := "stop"
+	chunk.Text = s.api.routeGeneratedImages(chunk.Text)
 
-	if toolCallingEnabled {
-		initialParseText := contentExtractor.ParseText()
-		simulated, parseErr := parseResponsesSimulationWithRetry(
-			initialParseText,
-			toolPolicy,
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					responsesSimulationRetryMessages(messages, toolPolicy),
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
-			},
-			func() (string, error) {
-				if sid != "" {
-					api.ctxCache.Delete(sessionKeyPrefix + sid)
-				}
-				retryResult, retryErr := api.responsesConversationOnce(
-					ctx,
-					messages,
-					cfg,
-					"",
-					true,
-				)
-				if retryErr != nil {
-					return "", retryErr
-				}
-				fullText = retryResult.text
-				finalConvID = retryResult.conversationID
-				if !messageItemEmitted {
-					contentExtractor = toolcalling.ContentStreamExtractor{}
-					contentExtractor.Feed(retryResult.text)
-				}
-				return retryResult.text, nil
-			},
-		)
-		if parseErr != nil {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			if api.responsesRequestCanceled(ctx, sid) {
-				return
-			}
-			if isProgressFailure(parseErr) {
-				_, code := classifyUpstreamError(parseErr)
-				sendFailed(code, upstreamErrorMessage("tool execution", code))
-			} else if errors.Is(parseErr, errSimulatedToolCallRequired) {
-				sendFailed(
-					simulatedToolCallRequiredCode,
-					parseErr.Error(),
-				)
-			} else {
-				sendFailed("upstream_error", parseErr.Error())
-			}
-			return
+	// Stream reasoning live. Under simulated tool calling it is filtered so the
+	// transport envelope never leaks; otherwise it passes through raw.
+	if chunk.Thinking != "" {
+		s.thinking.WriteString(chunk.Thinking)
+		if simulate {
+			s.emitReasoning(s.thinkingFilter.Feed(chunk.Thinking))
+		} else {
+			s.emitReasoning(chunk.Thinking)
 		}
-		committedContent := contentExtractor.Commit(
-			toolPolicy.allowedToolNames,
-		)
-		emitSimulatedDelta(committedContent)
-		if len(simulated.toolCalls) == 0 &&
-			(committedContent != "" || simulated.content == "") {
-			simulated.content = simulatedPublishedText
-		} else if messageItemEmitted {
-			simulated.content = simulatedPublishedText
-		}
-		fullText = simulated.content
-		toolCalls = simulated.toolCalls
-		finishReason = simulated.finishReason
-		// This is the one streaming path that publishes assistant content as it
-		// decodes it, so the claim cannot be replaced here.
-		warnOnUnverifiedCompletionClaim(fullText, toolPolicy.simulate, toolPolicy.ledger, len(toolCalls))
-		if truncated {
-			finishReason = "length"
-		}
-		if responsesResultEmpty(fullText, toolCalls) {
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			sendFailed(
-				upstreamEmptyResponseCode,
-				"The upstream completed without assistant content or a tool call.",
-			)
-			return
-		}
+	}
 
-		// Now emit the buffered text and tool calls as Responses events
-		outputIdx := 0
-		if reasoningItemEmitted {
-			outputIdx = 1
-		}
-		if messageItemEmitted {
-			outputIdx = messageOutputIndex + 1
-		}
+	// Handle text content
+	if chunk.Text == "" {
+		return streamLoopContinue
+	}
+	if simulate {
+		s.feedSimulatedText(chunk.Text, maxTokens)
+		return streamLoopContinue
+	}
+	return s.streamPlainText(chunk.Text, ch, maxTokens, goalOpen)
+}
 
-		if messageItemEmitted {
-			phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"part": map[string]any{
+// feedSimulatedText keeps the raw transport for the final tool-call parse while
+// publishing only the decoded assistant content.
+func (s *responsesStream) feedSimulatedText(text string, maxTokens int) {
+	// Flush remaining reasoning before content so the reasoning item is fully
+	// emitted at output_index 0 ahead of the message item.
+	if !s.reasoningFlushed {
+		s.emitReasoning(s.thinkingFilter.Flush())
+		s.reasoningFlushed = true
+	}
+	s.fullText.WriteString(text)
+	s.emitSimulatedDelta(s.contentExtractor.Feed(text), maxTokens)
+}
+
+// streamPlainText publishes answer text as it arrives, which is what a turn
+// with no simulated tool calling does.
+func (s *responsesStream) streamPlainText(text string, ch <-chan client.StreamChunk, maxTokens int, goalOpen bool) streamLoopStep {
+	if !s.messageItemEmitted {
+		// No tool call is known yet; the terminal item names the phase again
+		// once the turn is parsed.
+		s.openMessageItem(s.outputIndexAfterReasoning(), responsesMessagePhase(goalOpen, nil))
+	}
+
+	// Check max_tokens
+	if maxTokens > 0 && countTokens(s.fullText.String()+text) > maxTokens {
+		s.emitFinalPlainDelta(text, maxTokens)
+		s.truncated = true
+		// Drain remaining chunks
+		go drainStream(ch)
+		return streamLoopStop
+	}
+
+	s.fullText.WriteString(text)
+	s.textDelta(s.outputIndexAfterReasoning(), text)
+	return streamLoopContinue
+}
+
+// emitFinalPlainDelta publishes whatever of a chunk still fits under the token
+// ceiling.
+func (s *responsesStream) emitFinalPlainDelta(text string, maxTokens int) {
+	remaining := maxTokens - countTokens(s.fullText.String())
+	if remaining <= 0 {
+		return
+	}
+	delta, _ := truncateToTokens(text, remaining)
+	if delta == "" {
+		return
+	}
+	s.fullText.WriteString(delta)
+	s.textDelta(s.outputIndexAfterReasoning(), delta)
+}
+
+// finalizeMessage closes the message item that was opened while streaming.
+func (s *responsesStream) finalizeMessage(outputIdx int, fullText, phase string) {
+	if !s.messageItemEmitted {
+		return
+	}
+	s.event("response.output_text.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"text":          fullText,
+	})
+	s.event("response.content_part.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        fullText,
+			"annotations": []any{},
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":     s.msgID,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"phase":  phase,
+			"content": []map[string]any{
+				{
 					"type":        "output_text",
 					"text":        fullText,
 					"annotations": []any{},
 				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": messageOutputIndex,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  phase,
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
-		} else if fullText != "" || len(toolCalls) == 0 {
-			// Emit buffered text when no incremental content was available.
-			// Enforce max_output_tokens
-			if maxTokens > 0 {
-				if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
-					fullText = truncated
-					finishReason = "length"
-				}
-			}
-			phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
+			},
+		},
+	})
+}
 
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":      msgID,
-					"type":    "message",
-					"status":  "in_progress",
-					"role":    "assistant",
-					"phase":   phase,
-					"content": []any{},
-				},
-			})
-			sendEvent("response.content_part.added", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        "",
-					"annotations": []any{},
-				},
-			})
-			sendEvent("response.output_text.delta", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"delta":         fullText,
-			})
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
+// emitWholeMessage writes a buffered answer as a complete message item, which
+// is what a turn that published no incremental content needs.
+func (s *responsesStream) emitWholeMessage(outputIdx int, fullText, phase string) {
+	s.event("response.output_item.added", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":      s.msgID,
+			"type":    "message",
+			"status":  "in_progress",
+			"role":    "assistant",
+			"phase":   phase,
+			"content": []any{},
+		},
+	})
+	s.event("response.content_part.added", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []any{},
+		},
+	})
+	s.textDelta(outputIdx, fullText)
+	s.event("response.output_text.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"text":          fullText,
+	})
+	s.event("response.content_part.done", map[string]any{
+		"item_id":       s.msgID,
+		"output_index":  outputIdx,
+		"content_index": 0,
+		"part": map[string]any{
+			"type":        "output_text",
+			"text":        fullText,
+			"annotations": []any{},
+		},
+	})
+	s.event("response.output_item.done", map[string]any{
+		"output_index": outputIdx,
+		"item": map[string]any{
+			"id":     s.msgID,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"phase":  phase,
+			"content": []map[string]any{
+				{
 					"type":        "output_text",
 					"text":        fullText,
 					"annotations": []any{},
 				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  phase,
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
-			outputIdx++
-		}
+			},
+		},
+	})
+}
 
-		// Emit tool call items after the user-facing commentary.
-		toolTypes := responsesToolTypes(toolPolicy.tools)
-		for _, tc := range toolCalls {
-			callID := tc.ID
-			if callID == "" {
-				callID = "call_" + uuid.NewString()
-			}
-			sendEvent("response.output_item.added", map[string]any{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
-			})
-			for _, event := range responsesToolInputEvents(callID, tc, toolTypes, outputIdx) {
-				sendEvent(event.name, event.data)
-			}
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
-			})
-			outputIdx++
+// emitToolCallItems writes each tool call as its own output item, after the
+// user-facing commentary.
+func (s *responsesStream) emitToolCallItems(toolCalls []client.ToolCall, toolTypes map[string]string, outputIdx int) {
+	for _, tc := range toolCalls {
+		callID := tc.ID
+		if callID == "" {
+			callID = "call_" + uuid.NewString()
 		}
-	} else {
-		// Non-tool-calling mode: finalize message item if emitted
-		if messageItemEmitted {
-			outputIdx := 0
-			if reasoningItemEmitted {
-				outputIdx = 1
-			}
-			if truncated {
+		s.event("response.output_item.added", map[string]any{
+			"output_index": outputIdx,
+			"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "in_progress"),
+		})
+		for _, event := range responsesToolInputEvents(callID, tc, toolTypes, outputIdx) {
+			s.event(event.name, event.data)
+		}
+		s.event("response.output_item.done", map[string]any{
+			"output_index": outputIdx,
+			"item":         buildResponsesToolCallItem(callID, tc, toolTypes, "completed"),
+		})
+		outputIdx++
+	}
+}
+
+// emitSimulatedOutput writes the message and the tool call items of a parsed
+// turn, and reports the text and finish reason the token ceiling left.
+func (s *responsesStream) emitSimulatedOutput(fullText, finishReason string, toolCalls []client.ToolCall, maxTokens int, goalOpen bool, toolPolicy responsesToolPolicy) (string, string) {
+	// Now emit the buffered text and tool calls as Responses events
+	outputIdx := s.outputIndexAfterReasoning()
+	if s.messageItemEmitted {
+		outputIdx = s.messageOutputIndex + 1
+	}
+	phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
+
+	switch {
+	case s.messageItemEmitted:
+		s.finalizeMessage(s.messageOutputIndex, fullText, phase)
+	case fullText != "" || len(toolCalls) == 0:
+		// Emit buffered text when no incremental content was available.
+		// Enforce max_output_tokens
+		if maxTokens > 0 {
+			if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
+				fullText = truncated
 				finishReason = "length"
 			}
-			sendEvent("response.output_text.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"text":          fullText,
-			})
-			sendEvent("response.content_part.done", map[string]any{
-				"item_id":       msgID,
-				"output_index":  outputIdx,
-				"content_index": 0,
-				"part": map[string]any{
-					"type":        "output_text",
-					"text":        fullText,
-					"annotations": []any{},
-				},
-			})
-			sendEvent("response.output_item.done", map[string]any{
-				"output_index": outputIdx,
-				"item": map[string]any{
-					"id":     msgID,
-					"type":   "message",
-					"status": "completed",
-					"role":   "assistant",
-					"phase":  responsesMessagePhase(goalOpen, toolCalls, fullText),
-					"content": []map[string]any{
-						{
-							"type":        "output_text",
-							"text":        fullText,
-							"annotations": []any{},
-						},
-					},
-				},
-			})
 		}
+		s.emitWholeMessage(outputIdx, fullText, phase)
+		outputIdx++
 	}
 
+	s.emitToolCallItems(toolCalls, responsesToolTypes(toolPolicy.tools), outputIdx)
+	return fullText, finishReason
+}
+
+// responsesStreamProducedContent reports whether a plain turn produced
+// anything. A simulated turn is judged after its parse instead.
+func (api *APIServer) responsesStreamProducedContent(stream *responsesStream, sid string, simulate bool, fullText string) bool {
+	if simulate || !responsesResultEmpty(fullText, nil) {
+		return true
+	}
+	api.forgetSession(sid)
+	stream.failed(
+		upstreamEmptyResponseCode,
+		"The upstream completed without assistant content or a tool call.",
+	)
+	return false
+}
+
+// retryResponsesStream runs a fresh turn for a simulated Responses stream and
+// adopts its conversation. The extractor is reprimed only when nothing was
+// published yet, because a delta already on the wire cannot be taken back.
+func (api *APIServer) retryResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string) (string, error) {
+	api.forgetSession(sid)
+	retryResult, retryErr := api.responsesConversationOnce(ctx, messages, cfg, "", true)
+	if retryErr != nil {
+		return "", retryErr
+	}
+	stream.convID = retryResult.conversationID
+	if !stream.messageItemEmitted {
+		stream.contentExtractor = toolcalling.ContentStreamExtractor{}
+		stream.contentExtractor.Feed(retryResult.text)
+	}
+	return retryResult.text, nil
+}
+
+// simulatedResponsesText decides what the turn's final text is. Content that
+// was already published wins, because a delta cannot be taken back.
+func simulatedResponsesText(simulated responsesSimulationResult, stream *responsesStream, committedContent string) string {
+	if len(simulated.toolCalls) == 0 &&
+		(committedContent != "" || simulated.content == "") {
+		return stream.publishedText
+	}
+	if stream.messageItemEmitted {
+		return stream.publishedText
+	}
+	return simulated.content
+}
+
+// finishResponsesStream parses the turn and writes its output items. ok is
+// false when the request has already been answered.
+func (api *APIServer) finishResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, toolPolicy responsesToolPolicy, goalOpen bool, fullText string) (string, []client.ToolCall, string, bool) {
+	if toolPolicy.simulate {
+		return api.finishSimulatedResponsesStream(ctx, stream, messages, cfg, sid, maxTokens, toolPolicy, goalOpen)
+	}
+
+	// Non-tool-calling mode: finalize message item if emitted
+	finishReason := "stop"
+	if stream.truncated {
+		finishReason = "length"
+	}
+	stream.finalizeMessage(stream.outputIndexAfterReasoning(), fullText, responsesMessagePhase(goalOpen, nil, fullText))
+	return fullText, nil, finishReason, true
+}
+
+// finishSimulatedResponsesStream parses the buffered transport of a
+// tool-enabled turn and writes its output items.
+//
+// It takes no accumulated text: the raw transport lives in the extractor, and
+// what reaches the client is decided from the parse and from what was already
+// published.
+func (api *APIServer) finishSimulatedResponsesStream(ctx context.Context, stream *responsesStream, messages []payload.Message, cfg models.ModelConfig, sid string, maxTokens int, toolPolicy responsesToolPolicy, goalOpen bool) (string, []client.ToolCall, string, bool) {
+	simulated, parseErr := parseResponsesSimulationWithRetry(
+		stream.contentExtractor.ParseText(),
+		toolPolicy,
+		func() (string, error) {
+			return api.retryResponsesStream(ctx, stream, responsesSimulationRetryMessages(messages, toolPolicy), cfg, sid)
+		},
+		func() (string, error) {
+			return api.retryResponsesStream(ctx, stream, messages, cfg, sid)
+		},
+	)
+	if parseErr != nil {
+		api.forgetSession(sid)
+		if api.responsesRequestCanceled(ctx, sid) {
+			return "", nil, "", false
+		}
+		stream.failParse(parseErr)
+		return "", nil, "", false
+	}
+
+	committedContent := stream.contentExtractor.Commit(toolPolicy.allowedToolNames)
+	stream.emitSimulatedDelta(committedContent, maxTokens)
+	fullText := simulatedResponsesText(simulated, stream, committedContent)
+	toolCalls := simulated.toolCalls
+	finishReason := simulated.finishReason
+
+	// This is the one streaming path that publishes assistant content as it
+	// decodes it, so the claim cannot be replaced here.
+	warnOnUnverifiedCompletionClaim(fullText, toolPolicy.simulate, toolPolicy.ledger, len(toolCalls))
+	if stream.truncated {
+		finishReason = "length"
+	}
+	if responsesResultEmpty(fullText, toolCalls) {
+		api.forgetSession(sid)
+		stream.failed(
+			upstreamEmptyResponseCode,
+			"The upstream completed without assistant content or a tool call.",
+		)
+		return "", nil, "", false
+	}
+
+	fullText, finishReason = stream.emitSimulatedOutput(fullText, finishReason, toolCalls, maxTokens, goalOpen, toolPolicy)
+	return fullText, toolCalls, finishReason, true
+}
+
+// completeResponsesStream writes the final response object and ends the stream.
+func (api *APIServer) completeResponsesStream(stream *responsesStream, messages []payload.Message, toolPolicy responsesToolPolicy, goalOpen bool, fullText string, toolCalls []client.ToolCall, finishReason, sid string) {
 	// Build final response object for response.completed
 	status := "completed"
 	if finishReason == "length" {
@@ -7108,26 +7549,24 @@ func (api *APIServer) streamResponses(
 
 	promptTok := countPromptTokens(messages, toolPolicy.tools, toolPolicy.promptChoice)
 	completionTok := countTokens(fullText) + outputProtocolTokens
-	reasoningText := thinkingText.String()
+	reasoningText := stream.thinking.String()
 	reasoningTok := countTokens(reasoningText)
 
-	finalResponse := buildResponsesObject(responseID, createdAt, openaiModel, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(stream.responseID, stream.createdAt, stream.model, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
-	if sid != "" {
-		if shouldResetResponsesSession(fullText, toolCalls, nil) {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		} else {
-			api.storeSessionMapping(sid, finalConvID)
-		}
-	}
+	api.storeResponsesSession(sid, responsesTurn{
+		text:      fullText,
+		toolCalls: toolCalls,
+		convID:    stream.convID,
+	})
 
-	sendEvent("response.completed", map[string]any{
+	stream.event("response.completed", map[string]any{
 		"response": finalResponse,
 	})
 
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	_, _ = fmt.Fprintf(stream.w, "data: [DONE]\n\n")
+	stream.flusher.Flush()
 }
 
 // ===================================================================
@@ -7147,82 +7586,29 @@ func responsesCompactionConversationID(string) string {
 // It sends the conversation history to M365 Copilot with a compaction prompt,
 // then returns the summary wrapped in a compaction output item.
 func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	limitRequestBody(w, r, requestBodyMax)
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		api.sendRequestBodyError(w, err)
-		return
-	}
-	_ = r.Body.Close()
-
 	var req responsesRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+	if _, ok := api.readJSONRequest(w, r, &req, "handleResponsesCompact"); !ok {
 		return
 	}
 
 	// Parse model (may contain session ID suffix)
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
-	cfg, ok := api.resolveModel(w, modelKey)
+	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
 	}
 
-	deliberate, err := reasoningEffortRequestsDeliberation(req.Reasoning)
-	if err != nil {
-		logging.Errorf("handleResponsesCompact: %v", err)
-		api.sendError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	cfg = applyReasoningEffort(modelKey, cfg, deliberate)
-
-	// Convert Responses API input to payload.Message list
-	inputMessages := responsesInputToMessages(req.Input)
-
-	// Flatten the conversation history into a single user message with
-	// compaction instructions. M365 has no system role and responds to the
-	// last user message, so we must merge everything into one message to
-	// prevent the model from answering the conversation instead of summarizing it.
-	compactionInstr := defaultCompactionPrompt
-	instructions := strings.TrimSpace(req.Instructions)
-	if instructions != "" {
-		compactionInstr = instructions
-	}
-
-	var conversationText strings.Builder
-	conversationText.WriteString(compactionInstr)
-	conversationText.WriteString("\n\n")
-	for _, m := range inputMessages {
-		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
-	}
-	conversationText.WriteString("\nPlease provide the summary now.")
-
 	messages := []payload.Message{
-		{Role: "user", Content: conversationText.String()},
+		{Role: "user", Content: compactionPromptText(req)},
 	}
 
-	sid := resolveSessionID(r, sessionSources{
+	sid, storedConvID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:        modelSessionID,
 		PreviousResponseID: req.PreviousResponseID,
 		BodySessionID:      req.SessionID,
 		BodyUser:           req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-
-	convID := responsesCompactionConversationID(
-		api.ctxCache.Get(sessionKeyPrefix + sid),
-	)
+	}, messages)
+	convID := responsesCompactionConversationID(storedConvID)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -7233,9 +7619,31 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 
 	if req.Stream {
 		api.streamResponsesCompact(r.Context(), w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
-	} else {
-		api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+		return
 	}
+	api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+}
+
+// compactionPromptText flattens the conversation history into a single user
+// message carrying the compaction instructions.
+//
+// M365 has no system role and answers the last user message, so everything has
+// to be merged into one message; otherwise the model continues the conversation
+// instead of summarizing it.
+func compactionPromptText(req responsesRequest) string {
+	compactionInstr := defaultCompactionPrompt
+	if instructions := strings.TrimSpace(req.Instructions); instructions != "" {
+		compactionInstr = instructions
+	}
+
+	var conversationText strings.Builder
+	conversationText.WriteString(compactionInstr)
+	conversationText.WriteString("\n\n")
+	for _, m := range responsesInputToMessages(req.Input) {
+		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
+	}
+	conversationText.WriteString("\nPlease provide the summary now.")
+	return conversationText.String()
 }
 
 // buildCompactionResponseObject constructs the non-streaming compact response.
@@ -7310,18 +7718,41 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 	}
 }
 
+// failResponsesStream reports a failed turn on an open Responses stream, which
+// cannot be turned into an HTTP error because the headers are already out.
+func (api *APIServer) failResponsesStream(w http.ResponseWriter, flusher http.Flusher, sendEvent func(string, map[string]any), responseID, openaiModel string, createdAt int64, err error) {
+	failed := responsesStatusObject(responseID, openaiModel, "failed", createdAt)
+	failed["error"] = map[string]any{"message": err.Error()}
+	sendEvent("response.failed", map[string]any{"response": failed})
+	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// compactionSummaryText extracts the summary from a turn that ran in simulated
+// mode, where the answer travels inside the transport envelope.
+func compactionSummaryText(fullText string, hasTools bool, tools []toolcalling.ToolDef) string {
+	if !hasTools {
+		return fullText
+	}
+	sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
+	if sim.HasPayload {
+		return sim.Content
+	}
+	fullText = toolcalling.WithholdTransportEnvelope(fullText)
+	if toolcalling.IsContentPolicyBlock(fullText) {
+		// The stream is already open, so the refusal cannot be turned into an
+		// HTTP error the way the non-streaming paths do.
+		logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
+	}
+	return fullText
+}
+
 // streamResponsesCompact handles streaming compact requests.
 // It emits a standard Responses SSE stream but replaces the output item
 // with a single compaction item containing the summary.
 func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	flusher, ok := w.(http.Flusher)
+	flusher, ok := api.beginSSE(w)
 	if !ok {
-		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
 		return
 	}
 
@@ -7350,7 +7781,6 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 
 	var fullTextBuilder strings.Builder
 
-	var finalToolCalls []client.ToolCall
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 	for {
@@ -7360,37 +7790,16 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 		}
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
-			if sid != "" {
-				api.ctxCache.Delete(sessionKeyPrefix + sid)
-			}
-			failed := responsesStatusObject(responseID, openaiModel, "failed", createdAt)
-			failed["error"] = map[string]any{"message": chunk.Error.Error()}
-			sendEvent("response.failed", map[string]any{"response": failed})
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			api.forgetSession(sid)
+			api.failResponsesStream(w, flusher, sendEvent, responseID, openaiModel, createdAt, chunk.Error)
 			return
 		}
 		if chunk.Text != "" {
 			fullTextBuilder.WriteString(chunk.Text)
 		}
 	}
-	_ = finalToolCalls
-	fullText := fullTextBuilder.String()
 
-	// In simulated mode, extract plain content
-	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), toolcalling.ContractsFor(tools))
-		if sim.HasPayload {
-			fullText = sim.Content
-		} else {
-			fullText = toolcalling.WithholdTransportEnvelope(fullText)
-			if toolcalling.IsContentPolicyBlock(fullText) {
-				// The stream is already open, so the refusal cannot be turned
-				// into an HTTP error the way the non-streaming paths do.
-				logging.Warn("upstream content refusal on a streaming turn: M365 declined the request instead of answering")
-			}
-		}
-	}
+	fullText := compactionSummaryText(fullTextBuilder.String(), hasTools, tools)
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
@@ -7528,143 +7937,42 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 // It accepts multipart/form-data with an image file, prompt, and optional mask,
 // uploads the image to M365, sends the edit prompt, and returns the result.
 func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodOptions {
-		api.handleCORS(w, r)
-		return
-	}
-	if r.Method != http.MethodPost {
-		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-
-	// Parse multipart form
-	limitRequestBody(w, r, imageEditBodyMax)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
-		return
-	}
-
-	prompt := r.FormValue("prompt")
-	if prompt == "" {
-		api.sendError(w, http.StatusBadRequest, "prompt is required")
-		return
-	}
-
-	modelKey := r.FormValue("model")
-	if modelKey == "" {
-		modelKey = "gpt5.5-reasoning"
-	}
-	modelKey, modelSessionID := parseModelSessionID(modelKey)
-	cfg, ok := api.resolveModel(w, modelKey)
+	form, ok := api.parseImageEditForm(w, r)
 	if !ok {
 		return
 	}
-	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
 
-	n := 1
-	if nStr := r.FormValue("n"); nStr != "" {
-		if v, err := fmtAtoi(nStr); err == nil && v > 0 {
-			n = v
-		}
-	}
-	size := r.FormValue("size")
-	quality := r.FormValue("quality")
-	style := r.FormValue("style")
-	responseFormat := r.FormValue("response_format")
-
-	// Read image file(s). OpenAI API supports up to 16 images for GPT image models.
-	// Multipart form-data may send "image" as multiple form files.
-	imageFiles := r.MultipartForm.File["image"]
-	if len(imageFiles) == 0 {
-		api.sendError(w, http.StatusBadRequest, "image file is required")
+	images, ok := api.imageEditUploads(w, r)
+	if !ok {
 		return
 	}
-
-	var images []payload.ImageData
-	for i, fh := range imageFiles {
-		if i >= 16 {
-			break
-		}
-		f, err := fh.Open()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to open image %d: %v", i, err))
-			return
-		}
-		imgBytes, err := io.ReadAll(f)
-		_ = f.Close()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
-			return
-		}
-		imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
-		imgMime := fh.Header.Get("Content-Type")
-		if imgMime == "" {
-			imgMime = "image/png"
-		}
-		imgExt := extFromMediaType(imgMime)
-		imgName := fmt.Sprintf("edit-%d.%s", i, imgExt)
-		images = append(images, payload.ImageData{
-			Base64:    imgB64,
-			MediaType: imgMime,
-			FileName:  imgName,
-		})
+	mask, ok := api.imageEditMask(w, r)
+	if !ok {
+		return
+	}
+	if mask != nil {
+		images = append(images, *mask)
 	}
 
-	// Read optional mask
-	var maskB64, maskFileName, maskMimeType string
-	if maskFile, maskHeader, err := r.FormFile("mask"); err == nil {
-		maskBytes, err := io.ReadAll(maskFile)
-		_ = maskFile.Close()
-		if err != nil {
-			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read mask: %v", err))
-			return
-		}
-		maskB64 = base64.StdEncoding.EncodeToString(maskBytes)
-		maskMimeType = maskHeader.Header.Get("Content-Type")
-		if maskMimeType == "" {
-			maskMimeType = "image/png"
-		}
-		maskFileName = "mask." + extFromMediaType(maskMimeType)
-	}
+	sid := imageEditSessionID(r, form.modelSessionID)
+	convID := api.ctxCache.Get(sessionKeyPrefix + sid)
 
-	// Resolve session ID
-	sid := resolveSessionID(r, sessionSources{
-		ModelSuffix:   modelSessionID,
-		BodySessionID: r.FormValue("session_id"),
-		BodyUser:      r.FormValue("user"),
-	})
-	if sid == "" {
-		// An edit carries no message to hash, so an unnamed one gets a fresh
-		// session rather than joining another request's conversation.
-		sid = "img-edit-" + uuid.New().String()[:8]
-	}
-
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
-
-	// Build prompt with hints
-	fullPrompt := buildImagePromptWithHints(prompt, size, quality, style)
-
-	// Build multimodal message with image annotations
-	msg := payload.Message{Role: "user", Content: fullPrompt}
-	msg.Images = images
-	if maskB64 != "" {
-		msg.Images = append(msg.Images, payload.ImageData{
-			Base64:    maskB64,
-			MediaType: maskMimeType,
-			FileName:  maskFileName,
-		})
-	}
-
-	messages := []payload.Message{msg}
+	// Build the multimodal message: the prompt with its hints, and the images
+	messages := []payload.Message{{
+		Role: "user",
+		Content: buildImagePromptWithHints(
+			form.prompt,
+			r.FormValue("size"),
+			r.FormValue("quality"),
+			r.FormValue("style"),
+		),
+		Images: images,
+	}}
 
 	// Upload images and attach annotations
 	api.uploadImagesAndAnnotate(&messages, convID)
 
-	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, form.cfg.Tone, form.cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendUpstreamError(w, "image edit", err)
 		return
@@ -7673,7 +7981,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	api.storeSessionMapping(sid, finalConvID)
 
 	// Extract image URLs from response
-	dataItems := api.buildOpenAIImageData(respText, n, prompt, responseFormat)
+	dataItems := api.buildOpenAIImageData(respText, imageEditCount(r.FormValue("n")), form.prompt, r.FormValue("response_format"))
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
 		return
@@ -7683,6 +7991,150 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})
+}
+
+// imageEditForm is what an image edit request declares once its form is parsed.
+type imageEditForm struct {
+	prompt         string
+	modelSessionID string
+	cfg            models.ModelConfig
+}
+
+// parseImageEditForm answers the method gate, parses the multipart form and
+// resolves the model. ok is false when the request has already been answered.
+func (api *APIServer) parseImageEditForm(w http.ResponseWriter, r *http.Request) (imageEditForm, bool) {
+	if r.Method == http.MethodOptions {
+		api.handleCORS(w, r)
+		return imageEditForm{}, false
+	}
+	if r.Method != http.MethodPost {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return imageEditForm{}, false
+	}
+
+	// Parse multipart form
+	limitRequestBody(w, r, imageEditBodyMax)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
+		return imageEditForm{}, false
+	}
+
+	prompt := r.FormValue("prompt")
+	if prompt == "" {
+		api.sendError(w, http.StatusBadRequest, "prompt is required")
+		return imageEditForm{}, false
+	}
+
+	modelKey := r.FormValue("model")
+	if modelKey == "" {
+		modelKey = "gpt5.5-reasoning"
+	}
+	modelKey, modelSessionID := parseModelSessionID(modelKey)
+	cfg, ok := api.resolveModel(w, modelKey)
+	if !ok {
+		return imageEditForm{}, false
+	}
+	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
+	return imageEditForm{prompt: prompt, modelSessionID: modelSessionID, cfg: cfg}, true
+}
+
+// imageEditSessionID resolves the session an edit belongs to. An edit carries
+// no message to hash, so an unnamed one gets a fresh session rather than
+// joining another request's conversation.
+func imageEditSessionID(r *http.Request, modelSessionID string) string {
+	sid := resolveSessionID(r, sessionSources{
+		ModelSuffix:   modelSessionID,
+		BodySessionID: r.FormValue("session_id"),
+		BodyUser:      r.FormValue("user"),
+	})
+	if sid == "" {
+		return "img-edit-" + uuid.New().String()[:8]
+	}
+	return sid
+}
+
+// imageEditCount reads how many images the caller asked for, defaulting to one.
+func imageEditCount(raw string) int {
+	if raw == "" {
+		return 1
+	}
+	if v, err := fmtAtoi(raw); err == nil && v > 0 {
+		return v
+	}
+	return 1
+}
+
+// imageEditUploads reads the uploaded images. OpenAI supports up to 16 of them
+// for GPT image models, and multipart form-data may send "image" as several
+// form files. ok is false when the request has already been answered.
+func (api *APIServer) imageEditUploads(w http.ResponseWriter, r *http.Request) ([]payload.ImageData, bool) {
+	imageFiles := r.MultipartForm.File["image"]
+	if len(imageFiles) == 0 {
+		api.sendError(w, http.StatusBadRequest, "image file is required")
+		return nil, false
+	}
+
+	var images []payload.ImageData
+	for i, fh := range imageFiles {
+		if i >= 16 {
+			break
+		}
+		image, err := readUploadedImage(fh, fmt.Sprintf("edit-%d", i))
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
+			return nil, false
+		}
+		images = append(images, image)
+	}
+	return images, true
+}
+
+// readUploadedImage reads one uploaded file, naming it after baseName and
+// falling back to PNG when the client declared no type.
+func readUploadedImage(fh *multipart.FileHeader, baseName string) (payload.ImageData, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return payload.ImageData{}, err
+	}
+	imgBytes, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return payload.ImageData{}, err
+	}
+	mediaType := fh.Header.Get("Content-Type")
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(imgBytes),
+		MediaType: mediaType,
+		FileName:  baseName + "." + extFromMediaType(mediaType),
+	}, nil
+}
+
+// imageEditMask reads the optional mask. It reports a nil mask when the request
+// carries none, and ok false when the request has already been answered.
+func (api *APIServer) imageEditMask(w http.ResponseWriter, r *http.Request) (*payload.ImageData, bool) {
+	maskFile, maskHeader, err := r.FormFile("mask")
+	if err != nil {
+		return nil, true
+	}
+	maskBytes, err := io.ReadAll(maskFile)
+	_ = maskFile.Close()
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read mask: %v", err))
+		return nil, false
+	}
+	mediaType := maskHeader.Header.Get("Content-Type")
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return &payload.ImageData{
+		Base64:    base64.StdEncoding.EncodeToString(maskBytes),
+		MediaType: mediaType,
+		FileName:  "mask." + extFromMediaType(mediaType),
+	}, true
 }
 
 // buildImagePromptWithHints appends size, quality, and style hints to the prompt
@@ -7795,17 +8247,20 @@ func hostAllowed(host string, allowlist []string) bool {
 // sit inside the deployment's own network, and 169.254.169.254 is the cloud
 // metadata endpoint.
 func ipDisallowed(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return true
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		// 100.64.0.0/10 is carrier-grade NAT, which net.IP.IsPrivate misses.
-		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return true
-		}
-	}
-	return false
+	return ipInternal(ip) || ipCarrierGradeNAT(ip)
+}
+
+// ipInternal reports the ranges net.IP names itself.
+func ipInternal(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// ipCarrierGradeNAT reports 100.64.0.0/10, which net.IP.IsPrivate misses.
+func ipCarrierGradeNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
 }
 
 // validateImageDownloadURL decides whether a generated-image URL may be
@@ -7856,15 +8311,37 @@ func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
 // access token (acquired via SSO cookies with the M365 web app client_id) and
 // the fileToken query parameter sent as a header.
 func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
+	req, err := api.designerImageRequest(imageURL)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	// validateImageDownloadURL ran inside designerImageRequest: it requires
+	// https, an allowlisted host, a name that resolves, and no resolved address
+	// outside public space. The taint analysis cannot follow that validator.
+	// #nosec G704
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("download failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	return readDownloadedImage(resp)
+}
+
+// designerImageRequest builds the download, moving the fileToken query
+// parameter into the header the backend expects it in.
+func (api *APIServer) designerImageRequest(imageURL string) (*http.Request, error) {
 	if err := api.validateImageDownloadURL(imageURL); err != nil {
 		logging.Errorf("downloadImage: refusing download: %v", err)
-		return nil, "", err
+		return nil, err
 	}
 	logging.Infof("downloadImage: downloading image from %s", imageURL[:min(100, len(imageURL))])
 	parsedURL, err := neturl.Parse(imageURL)
 	if err != nil {
 		logging.Errorf("downloadImage: invalid URL: %v", err)
-		return nil, "", fmt.Errorf("invalid image URL: %w", err)
+		return nil, fmt.Errorf("invalid image URL: %w", err)
 	}
 
 	// Extract fileToken from query params and remove it from the URL
@@ -7872,24 +8349,23 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 	fileToken := query.Get("fileToken")
 	if fileToken == "" {
 		logging.Errorf("downloadImage: no fileToken in URL")
-		return nil, "", fmt.Errorf("no fileToken in image URL")
+		return nil, fmt.Errorf("no fileToken in image URL")
 	}
 	query.Del("fileToken")
 	parsedURL.RawQuery = query.Encode()
-	cleanURL := parsedURL.String()
 
 	// Acquire designerapp access token via SSO cookies
 	token, err := api.tokenManager.GetDesignerToken()
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to acquire designer token: %w", err)
+		return nil, fmt.Errorf("failed to acquire designer token: %w", err)
 	}
 
-	// cleanURL comes from the URL validateImageDownloadURL already cleared at
-	// the top of this function, minus its fileToken parameter.
+	// The address is the one validateImageDownloadURL already cleared above,
+	// minus its fileToken parameter.
 	// #nosec G704
-	req, err := http.NewRequest("GET", cleanURL, nil)
+	req, err := http.NewRequest("GET", parsedURL.String(), nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create image request: %w", err)
+		return nil, fmt.Errorf("failed to create image request: %w", err)
 	}
 	req.Header.Set("Authorization", token)
 	req.Header.Set("filetoken", fileToken)
@@ -7901,27 +8377,14 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+	return req, nil
+}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	// validateImageDownloadURL ran at the top of this function: it requires
-	// https, an allowlisted host, a name that resolves, and no resolved address
-	// outside public space. The taint analysis cannot follow that validator.
-	// #nosec G704
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("download failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
+// readDownloadedImage reads the image under a byte cap and reports the type the
+// server declared.
+func readDownloadedImage(resp *http.Response) ([]byte, string, error) {
 	if resp.StatusCode != http.StatusOK {
-		// Only an excerpt of this body is logged, so a truncated read is
-		// enough and the whole error page never has to be held in memory.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyExcerptMax))
-		errCode := resp.Header.Get("X-Errorcode")
-		failReason := resp.Header.Get("X-Failurereason")
-		logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
-			resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
-		return nil, "", fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
+		return nil, "", downloadImageFailure(resp)
 	}
 
 	// One extra byte distinguishes "exactly at the limit" from "truncated".
@@ -7943,6 +8406,20 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 
 	logging.Infof("downloadImage: success, size=%d bytes type=%s", len(body), contentType)
 	return body, contentType, nil
+}
+
+// downloadImageFailure reports why the backend refused, from the headers it
+// answers with.
+//
+// Only an excerpt of the body is logged, so a truncated read is enough and the
+// whole error page never has to be held in memory.
+func downloadImageFailure(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyExcerptMax))
+	errCode := resp.Header.Get("X-Errorcode")
+	failReason := resp.Header.Get("X-Failurereason")
+	logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
+		resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
+	return fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
 }
 
 // fmtAtoi parses an int from a string without importing strconv.

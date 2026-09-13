@@ -442,14 +442,7 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string, con
 // Anthropic message-shaped JSON object. Tool calls whose name is not in
 // `allowed` (when non-empty) are dropped.
 func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
-	// stop_reason
-	if sr, ok := payload["stop_reason"].(string); ok && sr != "" {
-		if sr == "tool_use" {
-			result.FinishReason = "tool_calls"
-		} else {
-			result.FinishReason = "stop"
-		}
-	}
+	applyAnthropicStopReason(payload, result)
 
 	content, ok := payload["content"].([]any)
 	if !ok || len(content) == 0 {
@@ -460,6 +453,27 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 		return
 	}
 
+	textParts := collectAnthropicBlocks(content, result, allowed, contracts)
+	finishAnthropicResult(result, textParts)
+}
+
+// applyAnthropicStopReason maps the Anthropic stop_reason onto the finish
+// reason this package reports.
+func applyAnthropicStopReason(payload map[string]any, result *SimulatedResult) {
+	sr, ok := payload["stop_reason"].(string)
+	if !ok || sr == "" {
+		return
+	}
+	if sr == "tool_use" {
+		result.FinishReason = "tool_calls"
+		return
+	}
+	result.FinishReason = "stop"
+}
+
+// collectAnthropicBlocks reads the content blocks, recording every accepted
+// tool_use on the result and returning the text blocks.
+func collectAnthropicBlocks(content []any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) []string {
 	var textParts []string
 	for _, block := range content {
 		bm, ok := block.(map[string]any)
@@ -473,43 +487,58 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 				textParts = append(textParts, t)
 			}
 		case "tool_use":
-			name, _ := bm["name"].(string)
-			if name == "" {
-				continue
-			}
-			if len(allowed) > 0 && !allowed[name] {
-				continue
-			}
-			// The model's own id is discarded. It tends to be a deterministic
-			// label such as call_istanbul_weather_001, which repeats across
-			// turns and makes clients reject a duplicate tool call id.
-			id := nextToolCallID()
-			// input is a JSON object in Anthropic format
-			var argsBytes []byte
-			if input, ok := bm["input"]; ok && input != nil {
-				argsBytes, _ = json.Marshal(input)
-			} else {
-				argsBytes = []byte("{}")
-			}
-			// Drop tool_use blocks that violate the tool's schema so the client
-			// never receives an unexecutable tool call to retry forever.
-			validated, reason, repairable := contracts.validate(name, json.RawMessage(argsBytes))
-			if reason != "" {
-				logging.Warnf("parseAnthropicPayload: dropping %q tool_use: %s", name, reason)
-				if repairable {
-					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
-				}
-				continue
-			}
-			argsBytes = validated
-			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:        id,
-				Name:      name,
-				Arguments: json.RawMessage(argsBytes),
-			})
+			appendAnthropicToolUse(bm, result, allowed, contracts)
 		}
 	}
+	return textParts
+}
 
+// anthropicToolInput renders a tool_use block's input, which is a JSON object
+// in Anthropic format, as call arguments.
+func anthropicToolInput(block map[string]any) []byte {
+	input, ok := block["input"]
+	if !ok || input == nil {
+		return []byte("{}")
+	}
+	argsBytes, _ := json.Marshal(input)
+	return argsBytes
+}
+
+// appendAnthropicToolUse records one tool_use block, or records why it was
+// dropped.
+func appendAnthropicToolUse(block map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	name, _ := block["name"].(string)
+	if name == "" {
+		return
+	}
+	if len(allowed) > 0 && !allowed[name] {
+		return
+	}
+	// The model's own id is discarded. It tends to be a deterministic label
+	// such as call_istanbul_weather_001, which repeats across turns and makes
+	// clients reject a duplicate tool call id.
+	id := nextToolCallID()
+
+	// Drop tool_use blocks that violate the tool's schema so the client never
+	// receives an unexecutable tool call to retry forever.
+	validated, reason, repairable := contracts.validate(name, json.RawMessage(anthropicToolInput(block)))
+	if reason != "" {
+		logging.Warnf("parseAnthropicPayload: dropping %q tool_use: %s", name, reason)
+		if repairable {
+			result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+		}
+		return
+	}
+	result.ToolCalls = append(result.ToolCalls, ToolCall{
+		ID:        id,
+		Name:      name,
+		Arguments: json.RawMessage(validated),
+	})
+}
+
+// finishAnthropicResult settles the content and the finish reason once every
+// block has been read. A turn that produced a tool call carries no text.
+func finishAnthropicResult(result *SimulatedResult, textParts []string) {
 	if len(result.ToolCalls) > 0 {
 		result.Content = ""
 		result.FinishReason = "tool_calls"
@@ -524,32 +553,28 @@ func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allo
 // scoreAnthropicCandidate scores a parsed JSON object by how much it resembles
 // an Anthropic Messages response. Higher is better; <=0 means unusable.
 func scoreAnthropicCandidate(candidate map[string]any) int {
-	score := 0
+	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
+	score := scoreAnthropicMarkers(candidate)
 	if isRequestLikeSimulatedPayload(candidate) {
 		score -= 180
 	}
 
-	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
-	content, hasContent := candidate["content"].([]any)
-	if hasContent && len(content) > 0 {
-		score += 220
-		// Check for tool_use / text blocks
-		for _, block := range content {
-			if bm, ok := block.(map[string]any); ok {
-				if bt, ok := bm["type"].(string); ok {
-					switch bt {
-					case "tool_use":
-						score += 90
-					case "text":
-						if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
-							score += 35
-						}
-					}
-				}
-			}
-		}
+	if content, hasContent := candidate["content"].([]any); hasContent && len(content) > 0 {
+		score += 220 + scoreAnthropicBlocks(content)
 	}
 
+	// Penalize OpenAI-shaped objects (choices array)
+	if _, ok := candidate["choices"].([]any); ok {
+		score -= 100
+	}
+
+	return score
+}
+
+// scoreAnthropicMarkers scores the fields that mark the message envelope rather
+// than its content.
+func scoreAnthropicMarkers(candidate map[string]any) int {
+	score := 0
 	if role, ok := candidate["role"].(string); ok && strings.ToLower(role) == "assistant" {
 		score += 30
 	}
@@ -562,12 +587,30 @@ func scoreAnthropicCandidate(candidate map[string]any) int {
 	if id, ok := candidate["id"].(string); ok && strings.HasPrefix(strings.ToLower(id), "msg_") {
 		score += 50
 	}
+	return score
+}
 
-	// Penalize OpenAI-shaped objects (choices array)
-	if _, ok := candidate["choices"].([]any); ok {
-		score -= 100
+// scoreAnthropicBlocks scores the tool_use and text blocks of a content array.
+func scoreAnthropicBlocks(content []any) int {
+	score := 0
+	for _, block := range content {
+		bm, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		bt, ok := bm["type"].(string)
+		if !ok {
+			continue
+		}
+		switch bt {
+		case "tool_use":
+			score += 90
+		case "text":
+			if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
+				score += 35
+			}
+		}
 	}
-
 	return score
 }
 
@@ -576,13 +619,31 @@ func scoreAnthropicCandidate(candidate map[string]any) int {
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
 func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts, preserveToolContent bool) {
+	message, ok := chatCompletionMessage(payload, result)
+	if !ok {
+		return
+	}
+
+	if toolCallsNode, ok := message["tool_calls"].([]any); ok && len(toolCallsNode) > 0 {
+		collectChatToolCalls(toolCallsNode, result, allowed, contracts)
+		if finishChatToolCalls(result, message, preserveToolContent) {
+			return
+		}
+	}
+
+	result.Content = normalizeMessageContent(message["content"])
+}
+
+// chatCompletionMessage reads the first choice's message and records its finish
+// reason. A payload carrying no usable choice reports false.
+func chatCompletionMessage(payload map[string]any, result *SimulatedResult) (map[string]any, bool) {
 	choices, ok := payload["choices"].([]any)
 	if !ok || len(choices) == 0 {
-		return
+		return nil, false
 	}
 	first, ok := choices[0].(map[string]any)
 	if !ok {
-		return
+		return nil, false
 	}
 
 	if fr, ok := first["finish_reason"].(string); ok && fr != "" {
@@ -591,59 +652,69 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 
 	message, ok := first["message"].(map[string]any)
 	if !ok {
+		return nil, false
+	}
+	return message, true
+}
+
+// collectChatToolCalls reads every entry of the tool_calls array.
+func collectChatToolCalls(nodes []any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	for _, tcNode := range nodes {
+		tc, ok := tcNode.(map[string]any)
+		if !ok {
+			continue
+		}
+		appendChatToolCall(tc, result, allowed, contracts)
+	}
+}
+
+// appendChatToolCall records one tool_calls entry, or records why it was
+// dropped.
+func appendChatToolCall(tc map[string]any, result *SimulatedResult, allowed map[string]bool, contracts ToolContracts) {
+	name, namespace, id, args := extractToolCallFields(tc)
+	if name == "" {
 		return
 	}
+	// Filter out tool calls whose name the client never declared
+	// (e.g. M365-injected "code_interpreter"). When allowed is empty,
+	// filtering is skipped (back-compat / non-tool requests).
+	if len(allowed) > 0 && !allowed[name] {
+		return
+	}
+	// Drop tool calls that violate the tool's schema so a malformed call is
+	// never forwarded to the client (which would reject it and retry in an
+	// endless loop).
+	validated, reason, repairable := contracts.validate(name, json.RawMessage(args))
+	if reason != "" {
+		logging.Warnf("parseChatCompletionPayload: dropping %q tool call: %s", name, reason)
+		if repairable {
+			result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
+		}
+		return
+	}
+	result.ToolCalls = append(result.ToolCalls, ToolCall{
+		ID:        id,
+		Name:      name,
+		Namespace: namespace,
+		Arguments: json.RawMessage(validated),
+	})
+}
 
-	if toolCallsNode, ok := message["tool_calls"].([]any); ok && len(toolCallsNode) > 0 {
-		for _, tcNode := range toolCallsNode {
-			tc, ok := tcNode.(map[string]any)
-			if !ok {
-				continue
-			}
-			name, namespace, id, args := extractToolCallFields(tc)
-			if name == "" {
-				continue
-			}
-			// Filter out tool calls whose name the client never declared
-			// (e.g. M365-injected "code_interpreter"). When allowed is empty,
-			// filtering is skipped (back-compat / non-tool requests).
-			if len(allowed) > 0 && !allowed[name] {
-				continue
-			}
-			// Drop tool calls that violate the tool's schema so a malformed call
-			// is never forwarded to the client (which would reject it and retry
-			// in an endless loop).
-			validated, reason, repairable := contracts.validate(name, json.RawMessage(args))
-			if reason != "" {
-				logging.Warnf("parseChatCompletionPayload: dropping %q tool call: %s", name, reason)
-				if repairable {
-					result.DroppedCalls = append(result.DroppedCalls, DroppedCall{Name: name, Reason: reason})
-				}
-				continue
-			}
-			args = string(validated)
-			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:        id,
-				Name:      name,
-				Namespace: namespace,
-				Arguments: json.RawMessage(args),
-			})
-		}
-		if len(result.ToolCalls) > 0 {
-			if preserveToolContent {
-				result.Content = normalizeMessageContent(message["content"])
-			} else {
-				result.Content = ""
-			}
-			result.FinishReason = "tool_calls"
-			return
-		}
+// finishChatToolCalls settles the result when the message carried tool calls,
+// and reports whether it did.
+func finishChatToolCalls(result *SimulatedResult, message map[string]any, preserveToolContent bool) bool {
+	if len(result.ToolCalls) == 0 {
 		if result.FinishReason == "tool_calls" {
 			result.FinishReason = "stop"
 		}
+		return false
 	}
-
-	result.Content = normalizeMessageContent(message["content"])
+	result.Content = ""
+	if preserveToolContent {
+		result.Content = normalizeMessageContent(message["content"])
+	}
+	result.FinishReason = "tool_calls"
+	return true
 }
 
 // extractToolCallFields pulls name/namespace/arguments from a tool_calls entry,
@@ -651,23 +722,15 @@ func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult,
 // and a flat shape ({name,arguments}).
 func extractToolCallFields(tc map[string]any) (name, namespace, id, args string) {
 	if fn, ok := tc["function"].(map[string]any); ok {
-		if n, ok := fn["name"].(string); ok && n != "" {
-			name = n
-		}
-		if ns, ok := fn["namespace"].(string); ok && ns != "" {
-			namespace = ns
-		}
+		name = stringField(fn, "name")
+		namespace = stringField(fn, "namespace")
 		args = normalizeArgumentsJSON(fn["arguments"])
 	}
 	if name == "" {
-		if n, ok := tc["name"].(string); ok && n != "" {
-			name = n
-		}
+		name = stringField(tc, "name")
 	}
 	if namespace == "" {
-		if ns, ok := tc["namespace"].(string); ok && ns != "" {
-			namespace = ns
-		}
+		namespace = stringField(tc, "namespace")
 	}
 	if args == "" {
 		args = normalizeArgumentsJSON(tc["arguments"])
@@ -676,6 +739,13 @@ func extractToolCallFields(tc map[string]any) (name, namespace, id, args string)
 	// clients reject as a duplicate tool call id.
 	id = nextToolCallID()
 	return
+}
+
+// stringField reads a string field, treating an absent value, a wrongly typed
+// one and an empty one alike.
+func stringField(node map[string]any, key string) string {
+	value, _ := node[key].(string)
+	return value
 }
 
 // normalizeArgumentsJSON ensures arguments is a JSON string value. If the node
@@ -739,28 +809,8 @@ func scoreSimulatedCandidate(candidate map[string]any) int {
 		score -= 180
 	}
 
-	choices, ok := candidate["choices"].([]any)
-	if ok && len(choices) > 0 {
-		score += 220
-		if first, ok := choices[0].(map[string]any); ok {
-			if message, ok := first["message"].(map[string]any); ok {
-				score += 80
-				if role, ok := message["role"].(string); ok && strings.ToLower(role) == "assistant" {
-					score += 20
-				}
-				if tc, ok := message["tool_calls"].([]any); ok && len(tc) > 0 {
-					score += 90
-				}
-				if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
-					score += 35
-				} else if arr, ok := message["content"].([]any); ok && len(arr) > 0 {
-					score += 20
-				}
-			}
-			if fr, ok := first["finish_reason"].(string); ok && fr != "" {
-				score += 15
-			}
-		}
+	if choices, ok := candidate["choices"].([]any); ok && len(choices) > 0 {
+		score += 220 + scoreChatChoice(choices[0])
 	}
 
 	if looksLikeChatChoiceObject(candidate) {
@@ -773,6 +823,39 @@ func scoreSimulatedCandidate(candidate map[string]any) int {
 		score += 50
 	}
 
+	return score
+}
+
+// scoreChatChoice scores the first choice of a chat.completion.
+func scoreChatChoice(node any) int {
+	first, ok := node.(map[string]any)
+	if !ok {
+		return 0
+	}
+	score := 0
+	if message, ok := first["message"].(map[string]any); ok {
+		score += 80 + scoreChatMessage(message)
+	}
+	if fr, ok := first["finish_reason"].(string); ok && fr != "" {
+		score += 15
+	}
+	return score
+}
+
+// scoreChatMessage scores the assistant message inside a chat.completion choice.
+func scoreChatMessage(message map[string]any) int {
+	score := 0
+	if role, ok := message["role"].(string); ok && strings.ToLower(role) == "assistant" {
+		score += 20
+	}
+	if tc, ok := message["tool_calls"].([]any); ok && len(tc) > 0 {
+		score += 90
+	}
+	if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
+		score += 35
+	} else if arr, ok := message["content"].([]any); ok && len(arr) > 0 {
+		score += 20
+	}
 	return score
 }
 
@@ -879,41 +962,23 @@ func extractBalancedJSONSegments(rawText string) []string {
 // extractBalancedJSONSegment returns the balanced segment starting at `start`
 // with opening char `opening` ('{' or '['), or "" if unbalanced.
 func extractBalancedJSONSegment(rawText string, start int, opening byte) string {
-	var closing byte
+	closing := byte(']')
 	if opening == '{' {
 		closing = '}'
-	} else {
-		closing = ']'
 	}
-	depth := 0
-	inString := false
-	escaped := false
 
+	depth := 0
 	for i := start; i < len(rawText); i++ {
-		ch := rawText[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if ch == '\\' {
-				escaped = true
-				continue
-			}
-			if ch == '"' {
-				inString = false
-			}
-			continue
-		}
-		if ch == '"' {
-			inString = true
-			continue
-		}
-		if ch == opening {
+		switch rawText[i] {
+		case '"':
+			// A brace inside a string is text, so the whole string is skipped.
+			// An unterminated one runs the index past the end and the segment is
+			// reported unbalanced.
+			content, _ := scanStreamJSONString(rawText, i+1)
+			i += 1 + len(content)
+		case opening:
 			depth++
-			continue
-		}
-		if ch == closing {
+		case closing:
 			depth--
 			if depth == 0 {
 				return strings.TrimSpace(rawText[start : i+1])

@@ -2,12 +2,47 @@ package servers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
 )
+
+type localToolEvidence struct {
+	calls   []toolcalling.LedgerCall
+	results []toolcalling.LedgerResult
+	tasks   toolcalling.TaskState
+}
+
+func (p *localToolEvidence) record(call toolcalling.ToolCall, result string) {
+	id := fmt.Sprintf("local-%d", len(p.calls))
+	p.calls = append(p.calls, toolcalling.LedgerCall{ID: id, Name: call.Name, Arguments: string(call.Arguments)})
+	p.results = append(p.results, toolcalling.LedgerResult{ID: id, Content: result})
+}
+
+func (p *localToolEvidence) ledger(rounds int) toolcalling.Ledger {
+	ledger := toolcalling.BuildLedger(p.calls, p.results, rounds)
+	ledger.Tasks = p.tasks
+	return ledger
+}
+
+func continuationRepairNote(sim toolcalling.SimulatedResult, messages []payload.Message, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string) (string, bool, bool) {
+	tasks := buildToolLedger(messages).Tasks
+	if tasks.Unfinished() && !toolcalling.TaskBlocked(sim.Content) {
+		return toolcalling.TaskContinuityInstruction + "\n" + tasks.Note(), false, true
+	}
+	return repairNote(sim, tools, contracts, rawText)
+}
+
+func (api *APIServer) checkedSimulation(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, choice string, noParallel bool, text string) (toolcalling.SimulatedResult, error) {
+	contracts := toolcalling.ContractsFor(tools).WithChoice(choice).WithoutParallel(noParallel)
+	sim := parseLoopSimulation(provider, text, tools, contracts)
+	sim = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, sim)
+	return guardToolProgress(buildToolLedger(messages), choice, sim)
+}
 
 func isProgressFailure(err error) bool {
 	return errors.Is(err, toolcalling.ErrTaskIncomplete) || errors.Is(err, toolcalling.ErrToolLoopStalled)

@@ -1,7 +1,8 @@
 services:
   m365bridge:
     build: .
-    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    image: m365bridge-fork:local
+    pull_policy: build
     container_name: m365bridge
     ports:
       - "8230:8000"

@@ -1,9 +1,7 @@
 # M365Bridge
 
-[![CI](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/ci.yml)
-[![Release](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/release.yml/badge.svg)](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/release.yml)
-[![Version](https://img.shields.io/github/v/release/KilimcininKorOglu/M365Bridge)](https://github.com/KilimcininKorOglu/M365Bridge/releases)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/KilimcininKorOglu/M365Bridge/pkgs/container/m365bridge)
+[![CI](https://github.com/jungie1995/M365Bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/jungie1995/M365Bridge/actions/workflows/ci.yml)
+[![Source](https://img.shields.io/badge/source-edited%20fork-blue)](https://github.com/jungie1995/M365Bridge)
 [![Go](https://img.shields.io/badge/Go-1.26.6%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20Compatible-412991)](#api-endpointleri)
 [![Anthropic Compatible](https://img.shields.io/badge/API-Anthropic%20Compatible-D97757?logo=anthropic&logoColor=white)](#api-endpointleri)
@@ -48,18 +46,19 @@ Copilot'un herkese açık bir API'si yok. Kendi web istemcisiyle bir SignalR Web
 
 ## Kurulum
 
-Aşağıdaki üç seçenekten birini seçin. Üçü de sizi aynı noktaya getirir: çalışan ama henüz Microsoft hesabınıza bağlanmamış bir servis. Bağlama işlemi ([Microsoft 365 hesabınızı bağlamak](#microsoft-365-hesabınızı-bağlamak)) hemen ardından gelir ve üç seçenek için de aynıdır.
+Bu sürüm `jungie1995/M365Bridge` çatalıdır. Görev kuyruğu, tarayıcıyla yeniden bağlantı ve görsel yönlendirme düzeltmeleri bu depodan derlenen binary'lerde bulunur. Güncel Windows kurulum/yükseltme adımları [İngilizce kurulum bölümünde](README.md#installation) açıklanmıştır; `scripts/install-bridge.ps1` mevcut `data/` içeriğini korur. İlk Microsoft hesap kurulumu ayrıca yapılır.
 
 ### Seçenek A: Docker
 
-En kısa yol. Yayınlanmış imaj derleme gerektirmez.
+Bu çatalın kaynak kodundan imajı derleyin.
 
-`docker-compose.yml` dosyasını oluşturun:
+Depoyla gelen `docker-compose.yml` dosyasını kullanın:
 
 ```yaml
 services:
   m365bridge:
-    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    build: .
+    image: m365bridge-fork:local
     container_name: m365bridge
     ports:
       - "8230:8000"
@@ -71,7 +70,9 @@ services:
 Başlatın:
 
 ```bash
-docker compose up -d
+git clone https://github.com/jungie1995/M365Bridge.git
+cd M365Bridge
+docker compose up --build -d
 ```
 
 Servis `http://localhost:8230` adresinde dinler. Host portu `8230`, container portu `8000`'e eşlenir; o port doluysa eşlemenin sol tarafını değiştirin. `./data` volume'ü kimlik bilgilerinizi, yapılandırmanızı ve cache'inizi tutar, silmeyin.
@@ -79,19 +80,20 @@ Servis `http://localhost:8230` adresinde dinler. Host portu `8230`, container po
 Düz `docker run` tercih ederseniz:
 
 ```bash
+docker build -t m365bridge-fork:local .
 docker run -d \
   --name m365bridge \
   -p 8230:8000 \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
-  ghcr.io/kilimcininkoroglu/m365bridge:latest
+  m365bridge-fork:local
 ```
 
 İmajı çekmek yerine kaynak kopyasından derlemek için `docker compose up --build -d` kullanın.
 
 ### Seçenek B: Hazır binary
 
-Platformunuza uygun binary'yi [Releases](https://github.com/KilimcininKorOglu/M365Bridge/releases) sayfasından indirin:
+Bu fork için bir sürüm yayımlandıysa platformunuza uygun binary'yi [Releases](https://github.com/jungie1995/M365Bridge/releases) sayfasından indirin ve SHA256SUMS ile doğrulayın. Aksi halde kaynak koddan derleyin:
 
 | Platform                    | Dosya                           |
 |-----------------------------|---------------------------------|
@@ -105,7 +107,7 @@ Platformunuza uygun binary'yi [Releases](https://github.com/KilimcininKorOglu/M3
 ```bash
 mkdir m365bridge && cd m365bridge
 curl -L -o m365-bridge \
-  https://github.com/KilimcininKorOglu/M365Bridge/releases/latest/download/m365-bridge-linux-amd64
+  https://github.com/jungie1995/M365Bridge/releases/latest/download/m365-bridge-linux-amd64
 chmod +x m365-bridge
 mkdir data
 ```
@@ -115,7 +117,7 @@ Binary bütün runtime yollarını içinde bulunduğu dizine göre çözer, yani
 ### Seçenek C: Kaynaktan derleme
 
 ```bash
-git clone https://github.com/KilimcininKorOglu/M365Bridge
+git clone https://github.com/jungie1995/M365Bridge.git
 cd M365Bridge
 go build -o bin/m365-bridge ./cmd/cli
 mkdir -p data

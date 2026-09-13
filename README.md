@@ -1,9 +1,7 @@
 # M365Bridge
 
-[![CI](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/ci.yml)
-[![Release](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/release.yml/badge.svg)](https://github.com/KilimcininKorOglu/M365Bridge/actions/workflows/release.yml)
-[![Version](https://img.shields.io/github/v/release/KilimcininKorOglu/M365Bridge)](https://github.com/KilimcininKorOglu/M365Bridge/releases)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/KilimcininKorOglu/M365Bridge/pkgs/container/m365bridge)
+[![CI](https://github.com/jungie1995/M365Bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/jungie1995/M365Bridge/actions/workflows/ci.yml)
+[![Source](https://img.shields.io/badge/source-edited%20fork-blue)](https://github.com/jungie1995/M365Bridge)
 [![Go](https://img.shields.io/badge/Go-1.26.6%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20Compatible-412991)](#api-endpoints)
 [![Anthropic Compatible](https://img.shields.io/badge/API-Anthropic%20Compatible-D97757?logo=anthropic&logoColor=white)](#api-endpoints)
@@ -11,6 +9,8 @@
 **English** | **[Türkçe](README.tr.md)**
 
 M365Bridge turns a Microsoft 365 Copilot subscription into an OpenAI-compatible and Anthropic-compatible HTTP API. Point any client that speaks either protocol at this service and it works: Claude Code, Codex, Cursor, Cline, the OpenAI and Anthropic SDKs, or your own code.
+
+This is the **jungie1995 fork**, based on [KilimcininKorOglu/M365Bridge](https://github.com/KilimcininKorOglu/M365Bridge), with task-queue continuity, progress-aware tool loops, dedicated Windows browser reconnect and browser-compatible image routing. Install from this repository to include those changes. The Go module/import path remains the upstream path for compatibility.
 
 ![The browser interface answering a question with sources](docs/webui-en.png)
 
@@ -48,50 +48,62 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 
 ## Installation
 
-Choose one of the three options below. All three leave you with the same thing: a running service that has not yet been connected to your Microsoft account. [Connecting your account](#connecting-your-microsoft-365-account) comes next and is identical for all three.
+Build this fork from source, either with the Windows installer below or Docker. These paths include both upstream improvements and our custom fixes. Microsoft account setup is a separate first-time step; upgrades preserve the existing `data/` directory.
+
+### Windows: fresh installation and upgrades
+
+Install Git and Go 1.26.6 or newer, then:
+
+```powershell
+git clone https://github.com/jungie1995/M365Bridge.git
+powershell -NoProfile -ExecutionPolicy Bypass -File .\M365Bridge\scripts\install-bridge.ps1 -InstallRoot C:\m365bridge
+```
+
+Use `-GoExecutable "C:\path\to\go.exe"` when Go is not on PATH. The installer builds the current checkout, checks the fork capabilities, installs text/image/browser-login binaries from the same build, and records the revision and SHA-256 in `install-manifest.json`. A fresh installation creates a private random API key and a 128-round tool budget in `data/.env`; the key is never printed. Existing configuration, tokens, cookies, caches and transcripts are preserved.
+
+For a fresh account, follow [Connecting your account](#connecting-your-microsoft-365-account), running `setup-wizard` from `C:\m365bridge`. Setup updates Microsoft identity fields while preserving the API key and other settings. Then start the text API on 8000 and the image API on 8001:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\m365bridge\scripts\start-bridge.ps1
+```
+
+Configure clients with the private key in `data/.env` and `http://localhost:8000/v1`. Use `M365BRIDGE_API_KEY` as the client-side environment variable where supported. The image worker enables `M365_BROWSER_IMAGE_ROUTING=1` in its own process. For later Microsoft reconnects, run `C:\m365bridge\connect-microsoft.cmd`.
+
+To upgrade, update your source checkout with `git pull --ff-only`, then run the same installer. Upgrades require idle endpoints, back up existing binaries and restart the services. `-NoStart` installs while leaving the services stopped. Fresh installs stay stopped until account setup. Only processes belonging to the chosen installation directory are managed.
+
+The advanced `scripts/install-verified-bridge.ps1 -CandidatePath <tested.exe>` installs an already-tested build using the same backup/preservation logic. No historical patch files need to be applied to a current checkout of this fork.
 
 ### Option A: Docker
 
-The shortest path. The published image needs no build.
-
-Create `docker-compose.yml`:
-
-```yaml
-services:
-  m365bridge:
-    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
-    container_name: m365bridge
-    ports:
-      - "8230:8000"
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-```
-
-Start it:
+Clone this fork and use the included compose file, which builds the edited source:
 
 ```bash
-docker compose up -d
+git clone https://github.com/jungie1995/M365Bridge.git
+cd M365Bridge
+docker compose up --build -d
 ```
 
 The service listens on `http://localhost:8230`. Host port `8230` maps to container port `8000`; change the left half of the mapping if that port is taken. The `./data` volume holds your credentials, configuration and cache, so keep it.
 
-If you prefer plain `docker run`:
+For authenticated client access, set a private `M365_API_KEY` in the mounted `data/.env`. Account setup preserves it. `M365_MAX_TOOL_ROUNDS=128` is the recommended starting budget for coding workflows. The dedicated Edge reconnect helper is Windows-only; container setup uses the account-import flow below.
+
+If you prefer plain `docker run`, build the local fork image first:
 
 ```bash
+docker build -t m365bridge-fork:local .
 docker run -d \
   --name m365bridge \
   -p 8230:8000 \
   -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
-  ghcr.io/kilimcininkoroglu/m365bridge:latest
+  m365bridge-fork:local
 ```
 
-To build the image from a source checkout instead of pulling it, use `docker compose up --build -d`.
+For upgrades, update the checkout and run `docker compose up --build -d` again, retaining the `data` volume.
 
-### Option B: Pre-built binary
+### Option B: Tagged fork binaries (when published)
 
-Download the binary for your platform from [Releases](https://github.com/KilimcininKorOglu/M365Bridge/releases):
+If this fork has a tagged release, download the binary for your platform and verify it against `SHA256SUMS` from [this fork's Releases](https://github.com/jungie1995/M365Bridge/releases). Otherwise use a source build; upstream stock binaries do not include our extensions.
 
 | Platform                    | File                            |
 |-----------------------------|---------------------------------|
@@ -105,7 +117,7 @@ Download the binary for your platform from [Releases](https://github.com/Kilimci
 ```bash
 mkdir m365bridge && cd m365bridge
 curl -L -o m365-bridge \
-  https://github.com/KilimcininKorOglu/M365Bridge/releases/latest/download/m365-bridge-linux-amd64
+  https://github.com/jungie1995/M365Bridge/releases/latest/download/m365-bridge-linux-amd64
 chmod +x m365-bridge
 mkdir data
 ```
@@ -115,7 +127,7 @@ The binary resolves every runtime path relative to the current working directory
 ### Option C: Build from source
 
 ```bash
-git clone https://github.com/KilimcininKorOglu/M365Bridge
+git clone https://github.com/jungie1995/M365Bridge.git
 cd M365Bridge
 go build -o bin/m365-bridge ./cmd/cli
 mkdir -p data

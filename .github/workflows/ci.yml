@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'integrate/**']
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -103,6 +104,25 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Complexity gate
+        run: go run github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0 -over 10 -ignore 'vendor/|helper-projects/|\.gocache/|web/' .
+
+  installation:
+    name: Windows installation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fresh install and data-preserving upgrade
+        shell: pwsh
+        run: ./scripts/test-installation.ps1 -TestRoot (Join-Path $env:RUNNER_TEMP 'bridge-install-test')
 
   docker:
     name: Docker Build

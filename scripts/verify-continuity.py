@@ -114,6 +114,27 @@ def image_test(args, key):
         return {"image_decoded": True, "width": image.width, "height": image.height, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def image_inspection_test(args, key):
+    if args.image is None:
+        raise ValueError("inspection mode requires --image pointing to the generated apple fixture")
+    encoded = base64.b64encode(args.image.read_bytes()).decode()
+    result = http(args.base_url + "/responses", {
+        "model": args.model, "stream": False,
+        "input": [
+            {"role": "user", "content": "Describe the main object and its color in the image returned by the tool. Use the image, not the filename."},
+            {"type": "function_call", "call_id": "inspect-image", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "inspect-image", "output": [
+                {"type": "input_text", "text": "Image for visual inspection."},
+                {"type": "input_image", "image_url": "data:image/png;base64," + encoded},
+            ]},
+        ],
+        "tools": [{"type": "function", "name": "view_image", "parameters": {"type": "object", "properties": {}}}],
+    }, key=key, timeout=180)
+    text = " ".join(block.get("text", "") for item in result.get("output", []) if item.get("type") == "message" for block in item.get("content", []))
+    assert "apple" in text.lower() and "red" in text.lower(), "image-bearing tool result was not correctly described"
+    return {"tool_image_inspected": True, "object_and_color_recognized": True}
+
+
 CHECK_SCRIPT = '''import json, time
 from pathlib import Path
 import hris
@@ -353,7 +374,8 @@ def codex_test(args, key, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["api", "opencode", "codex", "images"], required=True)
+    parser.add_argument("--mode", choices=["api", "opencode", "codex", "images", "inspection"], required=True)
+    parser.add_argument("--image", type=Path)
     parser.add_argument("--base-url", default="http://127.0.0.1:8002/v1")
     parser.add_argument("--model", default="gpt-5.6-reasoning")
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -374,7 +396,10 @@ def main():
         if args.bridge_exe:
             environment = os.environ.copy()
             environment["M365_ENABLE_WEB_UI"] = "false"
-            environment.pop("M365_BROWSER_IMAGE_ROUTING", None)
+            if args.mode == "images":
+                environment["M365_BROWSER_IMAGE_ROUTING"] = "1"
+            else:
+                environment.pop("M365_BROWSER_IMAGE_ROUTING", None)
             port = str(urllib.parse.urlsplit(args.base_url).port)
             bridge = subprocess.Popen([str(args.bridge_exe), "serve", "--port", port], cwd=args.bridge_home, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             deadline = time.monotonic() + 20
@@ -395,6 +420,8 @@ def main():
                     print(json.dumps(result), flush=True)
         elif args.mode == "images":
             report["result"] = image_test(args, key)
+        elif args.mode == "inspection":
+            report["result"] = image_inspection_test(args, key)
         elif args.mode == "opencode":
             report["result"] = opencode_test(args, key, args.work_dir / "fixture")
         else:

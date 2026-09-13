@@ -196,13 +196,7 @@ func BuildLedger(calls []LedgerCall, results []LedgerResult, rounds int) Ledger 
 		ledger.Completed = append(ledger.Completed, evidence)
 
 		signature := CallSignature(call.Name, call.Arguments)
-		digest := sha256.Sum256([]byte(strings.TrimSpace(result)))
-		if signature == ledger.lastSignature && digest == ledger.lastResult {
-			ledger.unchangedResults++
-		} else {
-			ledger.unchangedResults = 1
-		}
-		ledger.lastSignature, ledger.lastResult = signature, digest
+		ledger.recordProgress(signature, result)
 		if seenCall[signature] {
 			ledger.RepeatedCall = true
 			if ledger.RepetitionSignature == "" {
@@ -224,6 +218,16 @@ func BuildLedger(calls []LedgerCall, results []LedgerResult, rounds int) Ledger 
 
 	ledger.Tasks = TasksFromHistory(calls, results)
 	return ledger
+}
+
+func (l *Ledger) recordProgress(signature, result string) {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(result)))
+	if signature == l.lastSignature && digest == l.lastResult {
+		l.unchangedResults++
+	} else {
+		l.unchangedResults = 1
+	}
+	l.lastSignature, l.lastResult = signature, digest
 }
 
 // CompletedCount reports how many times a call with this name and these
