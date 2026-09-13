@@ -283,9 +283,10 @@ func indexOf(slice []string, s string) int {
 type APIServer struct {
 	config       *models.Config
 	tokenManager *auth.TokenManager
-	m365Client   *client.M365Client
+	m365Client   modelBackend
 	codeTools    *codingtools.Manager
 	ctxCache     *ContextCache
+	continuity   *continuityStore
 	// transcripts records the turns of a session so the browser interface can
 	// redraw a conversation. It is nil when the interface is disabled, which
 	// is what keeps message content off disk in a plain gateway deployment.
@@ -330,6 +331,7 @@ func NewAPIServer(config *models.Config, tokenManager *auth.TokenManager) *APISe
 		config:       config,
 		tokenManager: tokenManager,
 		ctxCache:     NewContextCache(contextCacheDir),
+		continuity:   configuredContinuityStore(),
 		imageRefs:    newImageRefStore(),
 	}
 	if config.EnableWebUI {
@@ -370,6 +372,7 @@ func (api *APIServer) Start(port int) error {
 	mux.HandleFunc("/v1/completions", api.withAuth(api.handleCompletions))
 	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
 	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.handleResponsesCompact))
+	mux.HandleFunc("/v1/responses/", api.withAuth(api.handleStoredResponse))
 	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
 	mux.HandleFunc("/v1/messages/count_tokens", api.withAuth(api.handleAnthropicCountTokens))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
@@ -1181,6 +1184,7 @@ func (api *APIServer) readConversationHistory(w http.ResponseWriter, r *http.Req
 
 	imported := false
 	if sid := strings.TrimSpace(r.URL.Query().Get("session_id")); sid != "" && api.transcripts != nil {
+		sid = api.sessionCacheID(r, sid)
 		api.transcripts.Replace(sid, entries)
 		api.ctxCache.Set(sessionKeyPrefix+sid, conversationID)
 		imported = true
@@ -1406,7 +1410,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 
 		contracts := toolcalling.ContractsFor(tools).WithoutParallel(noParallel)
 		simulated := parseLoopSimulation(provider, text, tools, contracts)
-		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, simulated)
+		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, simulated, r.Context())
 		if _, err := guardToolProgress(progress.ledger(iteration), "auto", simulated); err != nil {
 			return toolLoopResult{conversationID: currentConvID}, err
 		}
@@ -1527,7 +1531,7 @@ func appendToolLoopContinuation(messages []payload.Message, resultParts []string
 // with an appended corrective note on a fresh conversation and re-parses. It
 // returns the recovered result when the backend supplies valid tool calls, and
 // the original result otherwise so callers keep their existing fallback path.
-func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string, sim toolcalling.SimulatedResult) toolcalling.SimulatedResult {
+func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string, sim toolcalling.SimulatedResult, contexts ...context.Context) toolcalling.SimulatedResult {
 	if !sim.HasPayload && sim.Content == "" {
 		sim.Content = rawText
 	}
@@ -1546,7 +1550,7 @@ func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messag
 	last.Content = last.Content + "\n\n" + note
 	retry[len(retry)-1] = last
 
-	text, _, _, _, _, err := api.m365Client.ChatConversation(retry, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, true)
+	text, _, _, _, _, err := api.m365Client.ChatConversationContext(requestContext(contexts), retry, cfg.Tone, cfg.Override, "", api.config.UserOID, api.config.TenantID, true)
 	if err != nil {
 		logging.Errorf("repairSimulatedToolCalls: retry failed: %v", err)
 		return sim
@@ -1603,6 +1607,7 @@ func repairNote(sim toolcalling.SimulatedResult, tools []toolcalling.ToolDef, co
 // handleChatCompletions handles OpenAI chat completion requests.
 // chatCompletionsRequest is the wire shape of a /v1/chat/completions request.
 type chatCompletionsRequest struct {
+	Store          *bool                 `json:"store"`
 	Model          string                `json:"model"`
 	Messages       []payload.Message     `json:"messages"`
 	Stream         bool                  `json:"stream"`
@@ -1671,11 +1676,12 @@ func (api *APIServer) prepareToolLedger(w http.ResponseWriter, messages []payloa
 func (api *APIServer) sessionAndConversation(r *http.Request, sources sessionSources, messages []payload.Message) (sid, convID string) {
 	sid = resolveSessionID(r, sources)
 	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
+		sid = api.hashSessionIDFromMessages(r, simulationHistory(messages))
 	}
 	if sid == "" {
 		return "", ""
 	}
+	sid = api.sessionCacheID(r, sid)
 	return sid, api.ctxCache.Get(sessionKeyPrefix + sid)
 }
 
@@ -1694,6 +1700,10 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
+	if err := api.prepareSessionTasks(r, sessionSources{ModelSuffix: modelSessionID, BodySessionID: req.SessionID}, req.Messages, req.Store); err != nil {
+		api.sendContinuityError(w, err)
+		return
+	}
 	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleChatCompletions")
 	if !ok {
 		return
@@ -1739,7 +1749,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		api.streamChatCompletions(r.Context(), w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel, includeStreamUsage(req.StreamOptions))
 		return
 	}
-	api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel)
+	api.nonStreamChatCompletions(w, req.Messages, cfg, sid, convID, req.MaxTokens, hasTools, req.Tools, toolChoiceString(req.ToolChoice), stopSequences, noParallel, r.Context())
 }
 
 // runChatToolLoop runs the built-in coding tool loop for a chat request, which
@@ -1809,18 +1819,11 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:   modelSessionID,
 		BodySessionID: req.SessionID,
 		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, messages)
 
 	hasTools := len(toolcalling.RouteableTools(req.Tools)) > 0
 
@@ -1907,6 +1910,7 @@ func (api *APIServer) handleAnthropicCountTokens(w http.ResponseWriter, r *http.
 // handleAnthropicMessages handles Anthropic messages API requests.
 // anthropicMessagesRequest is the wire shape of a /v1/messages request.
 type anthropicMessagesRequest struct {
+	Store       *bool                 `json:"store"`
 	Model       string                `json:"model"`
 	Messages    []payload.Message     `json:"messages"`
 	System      json.RawMessage       `json:"system"`
@@ -1938,6 +1942,10 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
+	if err := api.prepareSessionTasks(r, sessionSources{ModelSuffix: modelSessionID, BodySessionID: req.SessionID}, req.Messages, req.Store); err != nil {
+		api.sendContinuityError(w, err)
+		return
+	}
 	ledger, ok := api.prepareToolLedger(w, req.Messages, "handleAnthropicMessages")
 	if !ok {
 		return
@@ -1975,7 +1983,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		api.streamAnthropicMessages(r.Context(), w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
 		return
 	}
-	api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel)
+	api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools, anthropicToolChoiceEnforcement(req.ToolChoice), req.StopSequences, noParallel, r.Context())
 }
 
 // anthropicChatMessages prepends the system prompt to the turn. Claude Code can
@@ -2044,18 +2052,11 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	messages := api.fimToChat(req.Prompt, "")
 
 	// Resolve session ID and conversation ID
-	sid := resolveSessionID(r, sessionSources{
+	sid, convID := api.sessionAndConversation(r, sessionSources{
 		ModelSuffix:   modelSessionID,
 		BodySessionID: req.SessionID,
 		BodyUser:      req.User,
-	})
-	if sid == "" {
-		sid = api.hashSessionIDFromMessages(r, messages)
-	}
-	var convID string
-	if sid != "" {
-		convID = api.ctxCache.Get(sessionKeyPrefix + sid)
-	}
+	}, messages)
 
 	if req.Stream {
 		api.streamAnthropicComplete(r.Context(), w, messages, cfg, req.Model, req.MaxTokensToSample, req.StopSequences, sid, convID)
@@ -2318,6 +2319,7 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 	}
 
 	stream := &chatStream{
+		ctx:     ctx,
 		api:     api,
 		w:       w,
 		flusher: flusher,
@@ -2380,6 +2382,7 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 // parsed for tool calls at the end: a tool call block may span several chunks,
 // so it cannot be parsed incrementally. With no tools the text streams directly.
 type chatStream struct {
+	ctx     context.Context
 	api     *APIServer
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -2519,7 +2522,7 @@ func (api *APIServer) chatToolCalls(stream *chatStream, messages []payload.Messa
 	}
 
 	var simToolCalls []toolcalling.ToolCall
-	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, fullText)
+	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, fullText, stream.ctx)
 	if err != nil {
 		return "", nil, err
 	}
@@ -2664,8 +2667,8 @@ func (api *APIServer) respondBufferedChat(w http.ResponseWriter, result toolLoop
 }
 
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
-func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
-	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool, contexts ...context.Context) {
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversationContext(requestContext(contexts), messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
@@ -2683,7 +2686,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
 		respText, toolCalls, finishReason, err = api.applySimulatedToolCalls(
-			toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+			toolLoopOpenAI, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls, requestContext(contexts),
 		)
 		if err != nil {
 			api.sendUpstreamError(w, "tool execution", err)
@@ -2741,8 +2744,8 @@ func (api *APIServer) forgetSession(sid string) {
 // applySimulatedToolCalls parses the simulated tool calls out of the answer in
 // the provider's own shape, and reports the text, the calls and the finish
 // reason that follow from it.
-func (api *APIServer) applySimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, noParallel bool, respText string, toolCalls []client.ToolCall) (string, []client.ToolCall, string, error) {
-	sim, err := api.checkedSimulation(provider, messages, cfg, tools, toolChoice, noParallel, respText)
+func (api *APIServer) applySimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, toolChoice string, noParallel bool, respText string, toolCalls []client.ToolCall, contexts ...context.Context) (string, []client.ToolCall, string, error) {
+	sim, err := api.checkedSimulation(provider, messages, cfg, tools, toolChoice, noParallel, respText, contexts...)
 	if err != nil {
 		return "", nil, "", err
 	}
@@ -2828,6 +2831,7 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 	}
 
 	stream := &anthropicStream{
+		ctx:     ctx,
 		api:     api,
 		w:       w,
 		flusher: flusher,
@@ -2900,6 +2904,7 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 // The wire format is a sequence of indexed content blocks, so which block is
 // open and which index it carries have to survive between chunks.
 type anthropicStream struct {
+	ctx     context.Context
 	api     *APIServer
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -3213,7 +3218,7 @@ func (api *APIServer) anthropicToolCalls(stream *anthropicStream, messages []pay
 	}
 
 	var simToolCalls []toolcalling.ToolCall
-	sim, err := api.checkedSimulation(toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, fullText)
+	sim, err := api.checkedSimulation(toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, fullText, stream.ctx)
 	if err != nil {
 		return "", nil, "", err
 	}
@@ -3364,8 +3369,8 @@ func (api *APIServer) replayAnthropicBlock(w http.ResponseWriter, index int, blo
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
-func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
-	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool, contexts ...context.Context) {
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversationContext(requestContext(contexts), messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.forgetSession(sid)
 		api.sendUpstreamError(w, "chat", err)
@@ -3383,7 +3388,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	// Parse simulated tool calls from response text if tool calling is enabled
 	if hasTools {
 		respText, toolCalls, finishReason, err = api.applySimulatedToolCalls(
-			toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls,
+			toolLoopAnthropic, messages, cfg, tools, toolChoice, noParallel, respText, toolCalls, requestContext(contexts),
 		)
 		if err != nil {
 			api.sendUpstreamError(w, "tool execution", err)
@@ -3443,6 +3448,7 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 	}
 
 	stream := &completionStream{
+		ctx:     ctx,
 		api:     api,
 		w:       w,
 		flusher: flusher,
@@ -3491,6 +3497,7 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 
 // completionStream carries what one text_completion turn streams.
 type completionStream struct {
+	ctx     context.Context
 	api     *APIServer
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -3640,7 +3647,7 @@ func (api *APIServer) completionToolCalls(stream *completionStream, messages []p
 	}
 
 	var simToolCalls []toolcalling.ToolCall
-	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, false, fullText)
+	sim, err := api.checkedSimulation(toolLoopOpenAI, messages, cfg, tools, toolChoice, false, fullText, stream.ctx)
 	if err != nil {
 		return "", nil, err
 	}
@@ -3763,6 +3770,13 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 // declares no expiry. A handler serving cacheable data sets its rule before it
 // calls this, and that rule is kept.
 func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) {
+	if response, ok := data.(map[string]any); ok {
+		decorateResponse(w, response)
+		if err := completeStoredResponse(w, response); err != nil {
+			statusCode = http.StatusServiceUnavailable
+			data = map[string]any{"error": map[string]any{"type": "server_error", "code": "continuity_unavailable", "message": "The response could not be retained for continuation; retry or use store=false."}}
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if w.Header().Get("Cache-Control") == "" {
@@ -4315,25 +4329,16 @@ func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 	return toolcalling.FilterTransportThinking(thinking)
 }
 
-// injectSimulatedPrompt replaces the last user message with a simulated-mode
-// prompt that embeds the entire OpenAI request JSON and asks M365 Copilot to
-// produce a valid chat.completion response in a single ```json block.
+// Tool turns carry one canonical request, because a reused M365 conversation
+// receives only the final message. Keeping the envelope on an earlier user
+// message would drop all but the last result of a parallel client tool batch.
 func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	if len(*messages) == 0 {
 		return
 	}
+	requestJSON = responsesPromptWithoutImageBytes(requestJSON)
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice, evidence)
-	for i := range slices.Backward(*messages) {
-		if (*messages)[i].Role == "user" {
-			(*messages)[i].TaskCancelled = latestUserCancelsTasks(*messages)
-			suffix := ""
-			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
-			}
-			(*messages)[i].Content = prompt + suffix
-			break
-		}
-	}
+	canonicalSimulationMessage(messages, prompt+simulationUserSuffix(*messages))
 }
 
 // injectSimulatedPromptResponses replaces the converted Responses history with
@@ -4342,10 +4347,34 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice,
 func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	requestJSON = responsesPromptWithoutImageBytes(requestJSON)
 	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice, evidence)
-	canonical := payload.Message{Role: "user", Content: prompt, TaskCancelled: latestUserCancelsTasks(*messages)}
+	canonicalSimulationMessage(messages, prompt)
+}
+
+func simulationUserSuffix(messages []payload.Message) string {
+	for _, message := range slices.Backward(messages) {
+		if message.Role == "user" && len(message.ToolResults) == 0 && !message.ToolProgress && strings.TrimSpace(message.Content) != "" {
+			return "\n\nCURRENT USER MESSAGE\n" + message.Content
+		}
+	}
+	return ""
+}
+
+func simulationHistory(messages []payload.Message) []payload.Message {
+	for len(messages) == 1 && len(messages[0].SimulationHistory) > 0 {
+		messages = messages[0].SimulationHistory
+	}
+	return messages
+}
+
+func canonicalSimulationMessage(messages *[]payload.Message, prompt string) {
+	canonical := payload.Message{Role: "user", Content: prompt, TaskCancelled: latestUserCancelsTasks(*messages), SimulationHistory: *messages}
 	for _, message := range *messages {
 		canonical.Images = append(canonical.Images, message.Images...)
 		canonical.Annotations = append(canonical.Annotations, message.Annotations...)
+		if message.HasTaskCheckpoint {
+			canonical.HasTaskCheckpoint = true
+			canonical.TaskCheckpoint = message.TaskCheckpoint
+		}
 	}
 	*messages = []payload.Message{canonical}
 }
@@ -4392,26 +4421,15 @@ func replaceResponseImages(value any, index *int) {
 	}
 }
 
-// injectSimulatedPromptAnthropic replaces the last user message with a
-// simulated-mode prompt that embeds the entire Anthropic request JSON and asks
-// M365 Copilot to produce a valid Anthropic Messages response in a single
-// ```json block.
+// Anthropic uses the same complete client-owned context boundary as Chat and
+// Responses, including batched results and attachments on a reused conversation.
 func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	if len(*messages) == 0 {
 		return
 	}
+	requestJSON = responsesPromptWithoutImageBytes(requestJSON)
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice, evidence)
-	for i := range slices.Backward(*messages) {
-		if (*messages)[i].Role == "user" {
-			(*messages)[i].TaskCancelled = latestUserCancelsTasks(*messages)
-			suffix := ""
-			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
-				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
-			}
-			(*messages)[i].Content = prompt + suffix
-			break
-		}
-	}
+	canonicalSimulationMessage(messages, prompt+simulationUserSuffix(*messages))
 }
 
 // reasoningEffortRank orders the accepted effort values. Anything at medium or
@@ -4570,12 +4588,14 @@ func activeToolMessages(messages []payload.Message) []payload.Message {
 // the current user turn. The server holds no state across such a loop, so the
 // incoming history is the only record of what already ran.
 func buildToolLedger(messages []payload.Message) toolcalling.Ledger {
+	messages = simulationHistory(messages)
 	active := activeToolMessages(messages)
 	calls, results, rounds := messageToolHistory(active)
 	ledger := toolcalling.BuildLedger(calls, results, rounds)
 	// Round counting resets at a new user request; unfinished work does not.
-	allCalls, allResults, _ := messageToolHistory(taskHistorySinceCancellation(messages))
-	ledger.Tasks = toolcalling.TasksFromHistory(allCalls, allResults)
+	scoped, initial := historyAfterCheckpoint(taskHistorySinceCancellation(messages))
+	allCalls, allResults, _ := messageToolHistory(scoped)
+	ledger.Tasks = toolcalling.TasksFromCheckpoint(initial, allCalls, allResults)
 	if latestUserCancelsTasks(messages) {
 		ledger.Tasks = toolcalling.TaskState{}
 	}
@@ -5561,11 +5581,15 @@ func newResponsesIdentity() (string, int64) {
 // reads the field from the first event finds it there.
 func responsesStatusObject(responseID, model, status string, createdAt int64) map[string]any {
 	return map[string]any{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": createdAt,
-		"status":     status,
-		"model":      model,
+		"id":                  responseID,
+		"object":              "response",
+		"created_at":          createdAt,
+		"status":              status,
+		"model":               model,
+		"output":              []any{},
+		"parallel_tool_calls": true,
+		"tools":               []any{},
+		"tool_choice":         "auto",
 	}
 }
 
@@ -5575,21 +5599,12 @@ func buildResponsesFailedEvent(
 	model, code, message string,
 	sequenceNumber int,
 ) map[string]any {
+	response := responsesStatusObject(responseID, model, "failed", createdAt)
+	response["error"] = map[string]any{"message": message, "type": "server_error", "code": code}
 	return map[string]any{
 		"type":            "response.failed",
 		"sequence_number": sequenceNumber,
-		"response": map[string]any{
-			"id":         responseID,
-			"object":     "response",
-			"created_at": createdAt,
-			"status":     "failed",
-			"model":      model,
-			"error": map[string]any{
-				"message": message,
-				"type":    "server_error",
-				"code":    code,
-			},
-		},
+		"response":        response,
 	}
 }
 
@@ -5893,6 +5908,7 @@ func limitResponsesStreamDelta(
 
 // responsesRequest is the JSON body for POST /v1/responses.
 type responsesRequest struct {
+	Store              *bool                 `json:"store"`
 	Model              string                `json:"model"`
 	Input              any                   `json:"input"`
 	Instructions       string                `json:"instructions"`
@@ -5933,9 +5949,15 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		api.handleResponsesCompact(w, r)
 		return
 	}
+	state, messages, err := api.prepareResponseState(r, &req)
+	if err != nil {
+		api.sendContinuityError(w, err)
+		return
+	}
+	w = withResponseState(w, state)
 
 	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
-	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	modelKey, _ := parseModelSessionID(req.Model)
 	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
@@ -5945,10 +5967,8 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	requestJSON := replaceRequestTools(bodyBytes, req.Tools)
-
-	// Convert Responses API input to payload.Message list
-	messages := responsesInputToMessages(req.Input)
+	state.request = req
+	requestJSON := responsesRequestJSON(bodyBytes, req.Input, req.Tools)
 
 	if api.answeredResponsesProbe(w, req, cfg, messages) {
 		return
@@ -5970,12 +5990,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		injectSimulatedPromptResponses(&messages, requestJSON, toolPolicy.promptChoice, toolPolicy.ledger.EvidenceNote())
 	}
 
-	sid, convID := api.sessionAndConversation(r, sessionSources{
-		ModelSuffix:        modelSessionID,
-		PreviousResponseID: req.PreviousResponseID,
-		BodySessionID:      req.SessionID,
-		BodyUser:           req.User,
-	}, messages)
+	sid, convID := api.sessionAndConversation(r, sessionSources{BodySessionID: state.sessionID}, messages)
 
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
@@ -6147,7 +6162,7 @@ func responsesInputToMessages(input any) []payload.Message {
 func responsesInputItem(m map[string]any) (payload.Message, bool) {
 	itemType, _ := m["type"].(string)
 	switch itemType {
-	case "compaction_trigger", "reasoning":
+	case "compaction_trigger", "reasoning", "m365_goal_checkpoint":
 		// A compaction trigger is a request rather than history, and M365
 		// generates its own reasoning.
 		return payload.Message{}, false
@@ -6228,9 +6243,11 @@ func responsesFunctionCallMessage(m map[string]any) payload.Message {
 // responsesToolSearchCallMessage reads a tool_search call out of the history.
 func responsesToolSearchCallMessage(m map[string]any) payload.Message {
 	arguments, _ := json.Marshal(m["arguments"])
+	callID, _ := m["call_id"].(string)
 	return payload.Message{
-		Role:    "assistant",
-		Content: fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
+		Role:      "assistant",
+		Content:   fmt.Sprintf("Tool search call: tool_search(%s)", string(arguments)),
+		ToolCalls: []payload.ToolCallRecord{{ID: callID, Name: "tool_search", Arguments: string(arguments)}},
 	}
 }
 
@@ -6240,14 +6257,17 @@ func responsesLoadedToolsMessage(itemType string, m map[string]any) payload.Mess
 	toolsJSON, _ := json.Marshal(m["tools"])
 	if itemType == "additional_tools" {
 		return payload.Message{
-			Role:    "tool",
-			Content: "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
+			Role:         "user",
+			ToolProgress: true,
+			Content:      "additional_tools: preserve these callable tools with their exact namespace, name, and schema: " + string(toolsJSON),
 		}
 	}
-	return payload.Message{
-		Role:    "tool",
-		Content: "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON),
+	text := "tool_search_output: preserve these loaded tools with their exact namespace, name, and schema: " + string(toolsJSON)
+	callID, _ := m["call_id"].(string)
+	if callID == "" {
+		return payload.Message{Role: "user", Content: text, ToolProgress: true}
 	}
+	return payload.Message{Role: "tool", Content: text, ToolCallID: callID, ToolResults: []payload.ToolResultRecord{{ID: callID, Content: string(toolsJSON)}}}
 }
 
 // responsesCompactionMessage reads a compaction summary of the earlier turns.
@@ -6333,7 +6353,17 @@ func latestGoalMarkerItem(items []any) int {
 	goalItem := -1
 	for index, item := range items {
 		record, ok := item.(map[string]any)
-		if !ok || record["role"] != "user" {
+		if !ok {
+			continue
+		}
+		if record["type"] == "m365_goal_checkpoint" {
+			goalItem = -1
+			if record["open"] == true {
+				goalItem = index
+			}
+			continue
+		}
+		if record["role"] != "user" {
 			continue
 		}
 		if strings.Contains(responsesExtractContent(record["content"]), goalContextMarker) {
@@ -6491,11 +6521,12 @@ func responsesInputIsEmpty(messages []payload.Message) bool {
 func (api *APIServer) respondResponsesProbe(w http.ResponseWriter, model string, stream bool) {
 	responseID, createdAt := newResponsesIdentity()
 	response := buildResponsesObject(responseID, createdAt, model, "", "", nil, nil, false, "stop", 0, 0, 0)
-
+	response["output"] = []any{}
+	if state := responseStateFrom(w); state != nil {
+		state.request.Store = new(false)
+	}
 	if !stream {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		writeJSONBody(w, response)
+		api.sendJSON(w, http.StatusOK, response)
 		return
 	}
 
@@ -6504,21 +6535,9 @@ func (api *APIServer) respondResponsesProbe(w http.ResponseWriter, model string,
 		return
 	}
 
-	sequenceNumber := 0
-	sendEvent := func(eventType string, data map[string]any) {
-		data["type"] = eventType
-		data["sequence_number"] = sequenceNumber
-		sequenceNumber++
-		jsonData, _ := json.Marshal(data)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
-
-	// Codex validates the item lifecycle, so the probe emits the envelope
-	// events even though it carries no output item.
-	sendEvent("response.created", map[string]any{"response": response})
-	sendEvent("response.in_progress", map[string]any{"response": response})
-	sendEvent("response.completed", map[string]any{"response": response})
+	s := newResponsesEventStream(api, w, flusher, responseID, model, createdAt)
+	s.begin()
+	s.end(response)
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
@@ -6580,20 +6599,20 @@ func buildResponsesObject(responseID string, createdAt int64, model, text, think
 	}
 
 	resp := map[string]any{
-		"id":          responseID,
-		"object":      "response",
-		"created_at":  createdAt,
-		"status":      status,
-		"model":       model,
-		"output":      output,
-		"output_text": text,
-		"usage": map[string]any{
-			"input_tokens":     promptTok,
-			"output_tokens":    completionTok,
-			"reasoning_tokens": reasoningTok,
-			"total_tokens":     promptTok + completionTok + reasoningTok,
-			"usage_source":     usageSource(),
-		},
+		"id":                  responseID,
+		"object":              "response",
+		"created_at":          createdAt,
+		"status":              status,
+		"model":               model,
+		"output":              output,
+		"output_text":         text,
+		"usage":               responseUsage(promptTok, completionTok, reasoningTok),
+		"parallel_tool_calls": true,
+		"tools":               []any{},
+		"tool_choice":         "auto",
+	}
+	if status == "incomplete" {
+		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
 	return resp
 }
@@ -6612,13 +6631,20 @@ func (api *APIServer) respondBufferedResponses(w http.ResponseWriter, result too
 		api.sendJSON(w, http.StatusOK, response)
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	for _, event := range []string{"response.created", "response.in_progress"} {
-		data, _ := json.Marshal(map[string]any{"type": event, "response": responsesStatusObject(responseID, cfg.OpenAIID, "in_progress", createdAt)})
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher, ok := api.beginSSE(w)
+	if !ok {
+		return
 	}
-	completed, _ := json.Marshal(map[string]any{"type": "response.completed", "response": response})
-	_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", completed)
+	s := newResponsesEventStream(api, w, flusher, responseID, cfg.OpenAIID, createdAt)
+	s.begin()
+	s.emitReasoning(result.thinking)
+	s.finalizeReasoning(false)
+	if result.text != "" || len(result.toolCalls) == 0 {
+		s.emitWholeMessage(s.nextOutput, result.text, responsesMessagePhase(goalOpen, result.toolCalls, result.text))
+	}
+	s.emitToolCallItems(result.toolCalls, toolTypes, s.nextOutput)
+	response["output"], _ = s.finalOutput()
+	s.end(response)
 }
 
 func (api *APIServer) responsesConversationOnce(
@@ -6977,7 +7003,11 @@ type responsesStream struct {
 	msgID       string
 	reasoningID string
 
-	sequenceNumber int
+	sequenceNumber       int
+	nextOutput           int
+	reasoningOutputIndex int
+	completedItems       map[int]map[string]any
+	failedSent           bool
 
 	fullText  strings.Builder
 	thinking  strings.Builder
@@ -7001,16 +7031,63 @@ type responsesStream struct {
 
 // event writes one Responses SSE event, numbering it in order.
 func (s *responsesStream) event(eventType string, data map[string]any) {
+	if s.failedSent {
+		return
+	}
+	s.trackOutputItem(eventType, data)
+	if response, ok := data["response"].(map[string]any); ok {
+		decorateResponse(s.w, response)
+		if eventType == "response.completed" || eventType == "response.incomplete" {
+			if err := completeStoredResponse(s.w, response); err != nil {
+				s.failed("continuity_unavailable", "The response could not be retained for continuation; retry or use store=false.")
+				return
+			}
+		}
+	}
 	data["type"] = eventType
 	data["sequence_number"] = s.sequenceNumber
 	s.sequenceNumber++
 	jsonData, _ := json.Marshal(data)
-	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, jsonData)
 	s.flusher.Flush()
+}
+
+func (s *responsesStream) trackOutputItem(eventType string, data map[string]any) {
+	index, ok := data["output_index"].(int)
+	if !ok {
+		return
+	}
+	if eventType == "response.output_item.added" && index >= s.nextOutput {
+		s.nextOutput = index + 1
+	}
+	if eventType == "response.output_item.done" {
+		if item, ok := data["item"].(map[string]any); ok {
+			if s.completedItems == nil {
+				s.completedItems = map[int]map[string]any{}
+			}
+			s.completedItems[index] = item
+		}
+	}
+}
+
+func (s *responsesStream) finalOutput() ([]map[string]any, bool) {
+	items := make([]map[string]any, 0, s.nextOutput)
+	for index := range s.nextOutput {
+		item, ok := s.completedItems[index]
+		if !ok {
+			return nil, false
+		}
+		items = append(items, item)
+	}
+	return items, true
 }
 
 // failed reports a failed turn and ends the stream.
 func (s *responsesStream) failed(code, message string) {
+	if s.failedSent {
+		return
+	}
+	s.failedSent = true
 	event := buildResponsesFailedEvent(
 		s.responseID,
 		s.createdAt,
@@ -7021,7 +7098,7 @@ func (s *responsesStream) failed(code, message string) {
 	)
 	s.sequenceNumber++
 	jsonData, _ := json.Marshal(event)
-	_, _ = fmt.Fprintf(s.w, "data: %s\n\n", jsonData)
+	_, _ = fmt.Fprintf(s.w, "event: response.failed\ndata: %s\n\n", jsonData)
 	_, _ = fmt.Fprint(s.w, "data: [DONE]\n\n")
 	s.flusher.Flush()
 }
@@ -7044,10 +7121,10 @@ func (s *responsesStream) failParse(parseErr error) {
 // outputIndexAfterReasoning returns the item index that follows the reasoning
 // item, which occupies index 0 whenever it exists.
 func (s *responsesStream) outputIndexAfterReasoning() int {
-	if s.reasoningItemEmitted {
-		return 1
+	if s.messageItemEmitted {
+		return s.messageOutputIndex
 	}
-	return 0
+	return s.nextOutput
 }
 
 // openMessageItem announces the assistant message item and its content part.
@@ -7116,18 +7193,19 @@ func (s *responsesStream) emitReasoning(delta string) {
 	}
 	s.reasoningEmitted.WriteString(delta)
 	if !s.reasoningItemEmitted {
+		s.reasoningOutputIndex = s.nextOutput
 		s.event("response.output_item.added", map[string]any{
-			"output_index": 0,
+			"output_index": s.reasoningOutputIndex,
 			"item": map[string]any{
 				"id":      s.reasoningID,
 				"type":    "reasoning",
 				"status":  "in_progress",
-				"summary": []map[string]any{{"type": "summary_text", "text": ""}},
+				"summary": []any{},
 			},
 		})
 		s.event("response.reasoning_summary_part.added", map[string]any{
 			"item_id":       s.reasoningID,
-			"output_index":  0,
+			"output_index":  s.reasoningOutputIndex,
 			"summary_index": 0,
 			"part":          map[string]any{"type": "summary_text", "text": ""},
 		})
@@ -7135,7 +7213,7 @@ func (s *responsesStream) emitReasoning(delta string) {
 	}
 	s.event("response.reasoning_summary_text.delta", map[string]any{
 		"item_id":       s.reasoningID,
-		"output_index":  0,
+		"output_index":  s.reasoningOutputIndex,
 		"summary_index": 0,
 		"delta":         delta,
 	})
@@ -7158,13 +7236,13 @@ func (s *responsesStream) finalizeReasoning(simulate bool) {
 	reasoningFinal := s.reasoningEmitted.String()
 	s.event("response.reasoning_summary_text.done", map[string]any{
 		"item_id":       s.reasoningID,
-		"output_index":  0,
+		"output_index":  s.reasoningOutputIndex,
 		"summary_index": 0,
 		"text":          reasoningFinal,
 	})
 	s.event("response.reasoning_summary_part.done", map[string]any{
 		"item_id":       s.reasoningID,
-		"output_index":  0,
+		"output_index":  s.reasoningOutputIndex,
 		"summary_index": 0,
 		"part": map[string]any{
 			"type": "summary_text",
@@ -7172,7 +7250,7 @@ func (s *responsesStream) finalizeReasoning(simulate bool) {
 		},
 	})
 	s.event("response.output_item.done", map[string]any{
-		"output_index": 0,
+		"output_index": s.reasoningOutputIndex,
 		"item": map[string]any{
 			"id":     s.reasoningID,
 			"type":   "reasoning",
@@ -7227,12 +7305,6 @@ func (s *responsesStream) chunk(chunk client.StreamChunk, ch <-chan client.Strea
 // feedSimulatedText keeps the raw transport for the final tool-call parse while
 // publishing only the decoded assistant content.
 func (s *responsesStream) feedSimulatedText(text string, maxTokens int) {
-	// Flush remaining reasoning before content so the reasoning item is fully
-	// emitted at output_index 0 ahead of the message item.
-	if !s.reasoningFlushed {
-		s.emitReasoning(s.thinkingFilter.Flush())
-		s.reasoningFlushed = true
-	}
 	s.fullText.WriteString(text)
 	s.emitSimulatedDelta(s.contentExtractor.Feed(text), maxTokens)
 }
@@ -7402,10 +7474,7 @@ func (s *responsesStream) emitToolCallItems(toolCalls []client.ToolCall, toolTyp
 // turn, and reports the text and finish reason the token ceiling left.
 func (s *responsesStream) emitSimulatedOutput(fullText, finishReason string, toolCalls []client.ToolCall, maxTokens int, goalOpen bool, toolPolicy responsesToolPolicy) (string, string) {
 	// Now emit the buffered text and tool calls as Responses events
-	outputIdx := s.outputIndexAfterReasoning()
-	if s.messageItemEmitted {
-		outputIdx = s.messageOutputIndex + 1
-	}
+	outputIdx := s.nextOutput
 	phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
 
 	switch {
@@ -7554,6 +7623,14 @@ func (api *APIServer) completeResponsesStream(stream *responsesStream, messages 
 
 	finalResponse := buildResponsesObject(stream.responseID, stream.createdAt, stream.model, fullText, reasoningText, toolCalls, responsesToolTypes(toolPolicy.tools), goalOpen, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
+	items, ok := stream.finalOutput()
+	if !ok {
+		stream.failed("invalid_stream_state", "The response ended with an unfinished output item.")
+		return
+	}
+	// The terminal snapshot is the exact set of items that were published,
+	// including their order and filtered reasoning, rather than a reconstruction.
+	finalResponse["output"] = items
 
 	api.storeResponsesSession(sid, responsesTurn{
 		text:      fullText,
@@ -7561,9 +7638,16 @@ func (api *APIServer) completeResponsesStream(stream *responsesStream, messages 
 		convID:    stream.convID,
 	})
 
-	stream.event("response.completed", map[string]any{
+	eventType := "response.completed"
+	if status == "incomplete" {
+		eventType = "response.incomplete"
+	}
+	stream.event(eventType, map[string]any{
 		"response": finalResponse,
 	})
+	if stream.failedSent {
+		return
+	}
 
 	_, _ = fmt.Fprintf(stream.w, "data: [DONE]\n\n")
 	stream.flusher.Flush()
@@ -7590,9 +7674,18 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	if _, ok := api.readJSONRequest(w, r, &req, "handleResponsesCompact"); !ok {
 		return
 	}
+	state, original, err := api.prepareResponseState(r, &req)
+	if err != nil {
+		api.sendContinuityError(w, err)
+		return
+	}
+	state.compact = captureCompactState(req.Input, original, state.sessionID)
+	state.compacting = true
+	state.compactAsResponse = r.URL.Path == "/v1/responses"
+	w = withResponseState(w, state)
 
 	// Parse model (may contain session ID suffix)
-	modelKey, modelSessionID := parseModelSessionID(req.Model)
+	modelKey, _ := parseModelSessionID(req.Model)
 	cfg, ok := api.responsesModelConfig(w, modelKey, req.Reasoning)
 	if !ok {
 		return
@@ -7602,12 +7695,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		{Role: "user", Content: compactionPromptText(req)},
 	}
 
-	sid, storedConvID := api.sessionAndConversation(r, sessionSources{
-		ModelSuffix:        modelSessionID,
-		PreviousResponseID: req.PreviousResponseID,
-		BodySessionID:      req.SessionID,
-		BodyUser:           req.User,
-	}, messages)
+	sid, storedConvID := api.sessionAndConversation(r, sessionSources{BodySessionID: state.sessionID}, messages)
 	convID := responsesCompactionConversationID(storedConvID)
 
 	// Upload any images found in multimodal content
@@ -7621,7 +7709,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 		api.streamResponsesCompact(r.Context(), w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
 		return
 	}
-	api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+	api.nonStreamResponsesCompact(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools, r.Context())
 }
 
 // compactionPromptText flattens the conversation history into a single user
@@ -7661,28 +7749,20 @@ func buildCompactionResponseObject(responseID string, createdAt int64, model, su
 
 	return map[string]any{
 		"id":         responseID,
-		"object":     "response",
+		"object":     "response.compaction",
 		"created_at": createdAt,
 		"status":     "completed",
 		"model":      model,
 		"output":     output,
-		"usage": map[string]any{
-			"input_tokens":  promptTok,
-			"output_tokens": completionTok,
-			"total_tokens":  promptTok + completionTok,
-			"usage_source":  usageSource(),
-		},
+		"usage":      responseUsage(promptTok, completionTok, 0),
 	}
 }
 
 // nonStreamResponsesCompact handles non-streaming compact requests.
-func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, _, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, contexts ...context.Context) {
+	respText, _, _, finishReason, _, err := api.m365Client.ChatConversationContext(requestContext(contexts), messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		logging.Errorf("nonStreamResponsesCompact: chat failed: %v", err)
-		if sid != "" {
-			api.ctxCache.Delete(sessionKeyPrefix + sid)
-		}
 		api.sendUpstreamError(w, "compaction", err)
 		return
 	}
@@ -7698,10 +7778,13 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 	}
 
 	// Enforce max_output_tokens
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
-			respText = truncated
-		}
+	if strings.TrimSpace(respText) == "" {
+		api.sendUpstreamError(w, "compaction", client.ErrEmptyTurn)
+		return
+	}
+	if compactionTruncated(respText, finishReason, maxTokens) {
+		api.sendContinuityError(w, errCompactionIncomplete)
+		return
 	}
 
 	// The compaction request declares no tools, so only message framing counts.
@@ -7709,7 +7792,12 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 	completionTok := countTokens(respText) + outputProtocolTokens
 
 	responseID, createdAt := newResponsesIdentity()
-	response := buildCompactionResponseObject(responseID, createdAt, cfg.OpenAIID, respText, promptTok, completionTok)
+	sealed, err := sealCompactionSummary(w, respText)
+	if err != nil {
+		api.sendContinuityError(w, err)
+		return
+	}
+	response := buildCompactionResponseObject(responseID, createdAt, cfg.OpenAIID, sealed, promptTok, completionTok)
 
 	api.sendJSON(w, http.StatusOK, response)
 
@@ -7722,7 +7810,8 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 // cannot be turned into an HTTP error because the headers are already out.
 func (api *APIServer) failResponsesStream(w http.ResponseWriter, flusher http.Flusher, sendEvent func(string, map[string]any), responseID, openaiModel string, createdAt int64, err error) {
 	failed := responsesStatusObject(responseID, openaiModel, "failed", createdAt)
-	failed["error"] = map[string]any{"message": err.Error()}
+	_, code, message := streamErrorFields("compaction", err)
+	failed["error"] = map[string]any{"message": message, "code": code}
 	sendEvent("response.failed", map[string]any{"response": failed})
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -7760,56 +7849,33 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 	openaiModel := cfg.OpenAIID
 	compactionID := fmt.Sprintf("cmp_%s", responseID)
 
-	sendEvent := func(eventType string, data map[string]any) {
-		data["type"] = eventType
-		jsonData, _ := json.Marshal(data)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonData)
-		flusher.Flush()
-	}
-
-	// Send response.created event
-	sendEvent("response.created", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
-	})
-
-	// Send response.in_progress event
-	sendEvent("response.in_progress", map[string]any{
-		"response": responsesStatusObject(responseID, openaiModel, "in_progress", createdAt),
-	})
-
+	s := newResponsesEventStream(api, w, flusher, responseID, openaiModel, createdAt)
+	s.begin()
 	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	var fullTextBuilder strings.Builder
-
-	keepalive := time.NewTicker(sseKeepaliveInterval)
-	defer keepalive.Stop()
-	for {
-		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeSSEKeepalive(w, flusher) })
-		if !more {
-			break
-		}
-		if chunk.Error != nil {
-			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
-			api.forgetSession(sid)
-			api.failResponsesStream(w, flusher, sendEvent, responseID, openaiModel, createdAt, chunk.Error)
-			return
-		}
-		if chunk.Text != "" {
-			fullTextBuilder.WriteString(chunk.Text)
-		}
+	text, err := s.collectCompactionText(ctx, ch)
+	if err != nil {
+		_, code, message := streamErrorFields("compaction", err)
+		s.failed(code, message)
+		return
+	}
+	fullText := compactionSummaryText(text, hasTools, tools)
+	if strings.TrimSpace(fullText) == "" {
+		api.failResponsesStream(w, flusher, s.event, responseID, openaiModel, createdAt, client.ErrEmptyTurn)
+		return
 	}
 
-	fullText := compactionSummaryText(fullTextBuilder.String(), hasTools, tools)
-
-	// Enforce max_output_tokens
-	if maxTokens > 0 {
-		if truncated, ok := truncateToTokens(fullText, maxTokens); ok {
-			fullText = truncated
-		}
+	if compactionTruncated(fullText, "", maxTokens) {
+		s.failed("compaction_incomplete", errCompactionIncomplete.Error())
+		return
 	}
 
+	sealed, err := sealCompactionSummary(w, fullText)
+	if err != nil {
+		api.failResponsesStream(w, flusher, s.event, responseID, openaiModel, createdAt, err)
+		return
+	}
 	// Emit the compaction output item
-	sendEvent("response.output_item.added", map[string]any{
+	s.event("response.output_item.added", map[string]any{
 		"output_index": 0,
 		"item": map[string]any{
 			"id":   compactionID,
@@ -7817,12 +7883,12 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 		},
 	})
 
-	sendEvent("response.output_item.done", map[string]any{
+	s.event("response.output_item.done", map[string]any{
 		"output_index": 0,
 		"item": map[string]any{
 			"id":                compactionID,
 			"type":              "compaction",
-			"encrypted_content": fullText,
+			"encrypted_content": sealed,
 		},
 	})
 
@@ -7830,16 +7896,10 @@ func (api *APIServer) streamResponsesCompact(ctx context.Context, w http.Respons
 	promptTok := countPromptTokens(messages, nil, "")
 	completionTok := countTokens(fullText) + outputProtocolTokens
 
-	finalResponse := buildCompactionResponseObject(responseID, createdAt, openaiModel, fullText, promptTok, completionTok)
+	finalResponse := buildCompactionResponseObject(responseID, createdAt, openaiModel, sealed, promptTok, completionTok)
 
-	sendEvent("response.completed", map[string]any{
-		"response": finalResponse,
-	})
-
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-
-	if sid != "" && strings.TrimSpace(fullText) != "" {
+	s.end(finalResponse)
+	if sid != "" && !s.failedSent {
 		api.ctxCache.Delete(sessionKeyPrefix + sid)
 	}
 }
@@ -7954,7 +8014,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		images = append(images, *mask)
 	}
 
-	sid := imageEditSessionID(r, form.modelSessionID)
+	sid := api.sessionCacheID(r, imageEditSessionID(r, form.modelSessionID))
 	convID := api.ctxCache.Get(sessionKeyPrefix + sid)
 
 	// Build the multimodal message: the prompt with its hints, and the images

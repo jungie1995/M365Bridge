@@ -195,7 +195,10 @@ func TestBufferedResponsesMatchesTheChatPromptCount(t *testing.T) {
 	input := usageNumber(t, usage, "input_tokens")
 	output := usageNumber(t, usage, "output_tokens")
 	reasoning := usageNumber(t, usage, "reasoning_tokens")
-	if total := usageNumber(t, usage, "total_tokens"); total != input+output+reasoning {
-		t.Fatalf("total_tokens = %d, want %d", total, input+output+reasoning)
+	if total := usageNumber(t, usage, "total_tokens"); total != input+output {
+		t.Fatalf("total_tokens = %d, want %d; Responses output includes reasoning", total, input+output)
+	}
+	if output < reasoning {
+		t.Fatal("reasoning must be included in output_tokens")
 	}
 }

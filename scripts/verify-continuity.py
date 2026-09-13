@@ -10,6 +10,7 @@ import argparse
 import base64
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ import sys
 import threading
 import time
 import secrets
+from collections import Counter
+from types import SimpleNamespace
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -216,8 +219,18 @@ def collect_stderr(process, lines):
             del lines[0]
 
 
+def fixture_suite(args):
+    if args.fixture == "kanban":
+        spec = importlib.util.spec_from_file_location("kanban_fixture", Path(__file__).resolve().parents[1] / "tests/kanban_fixture.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return SimpleNamespace(create=module.create, verify=module.verify, prompt=module.first_prompt, followups=module.FOLLOWUPS, status=module.STATUS_PROMPT)
+    return SimpleNamespace(create=fixture, verify=verify_fixture, prompt=first_prompt, followups=FOLLOWUPS, status=STATUS_PROMPT)
+
+
 def opencode_test(args, key, root):
-    fixture(root)
+    suite = fixture_suite(args)
+    suite.create(root)
     environment = os.environ.copy()
     environment["M365BRIDGE_API_KEY"] = key
     password = secrets.token_hex(24)
@@ -251,24 +264,54 @@ def opencode_test(args, key, root):
         session = http(base + "/session" + query, {"title": "Bridge continuity integration fixture"}, extra_headers=auth_headers)["id"]
         endpoint = base + "/session/" + session + "/prompt_async" + query
         model = {"providerID": "m365bridge", "modelID": args.model}
-        http(endpoint, {"model": model, "parts": [{"type": "text", "text": first_prompt(sys.executable)}]}, extra_headers=auth_headers)
+        http(endpoint, {"model": model, "parts": [{"type": "text", "text": suite.prompt(sys.executable)}]}, extra_headers=auth_headers)
         deadline = time.monotonic() + args.timeout
         sent = False
+        compacted = False
+        messages = []
+        started_at = time.monotonic()
         while time.monotonic() < deadline:
             if not sent and (root / "started").exists():
-                for marker, prompt in FOLLOWUPS:
+                for marker, prompt in suite.followups:
                     (root / marker).touch()
                     http(endpoint, {"model": model, "parts": [{"type": "text", "text": prompt}]}, extra_headers=auth_headers)
-                http(endpoint, {"model": model, "parts": [{"type": "text", "text": STATUS_PROMPT}]}, extra_headers=auth_headers)
+                http(endpoint, {"model": model, "parts": [{"type": "text", "text": suite.status}]}, extra_headers=auth_headers)
                 sent = True
+            if args.compact and sent and not compacted and (root / "check-runs.jsonl").exists():
+                http(base + "/session/" + session + "/abort" + query, {}, extra_headers=auth_headers)
+                http(base + "/session/" + session + "/summarize" + query, {"providerID": "m365bridge", "modelID": args.model, "auto": False}, extra_headers=auth_headers)
+                compact_messages = http(base + "/session/" + session + "/message" + query, extra_headers=auth_headers)
+                assert any(message.get("info", {}).get("summary") for message in compact_messages), "OpenCode did not produce a compaction summary"
+                if args.restart_bridge:
+                    args.restart_candidate()
+                http(endpoint, {"model": model, "parts": [{"type": "text", "text": "Resume the unfinished work from the conversation and plan. Retain the queued requirements, and verify the completed implementation with the unchanged checks."}]}, extra_headers=auth_headers)
+                compacted = True
             states = http(base + "/session/status" + query, extra_headers=auth_headers)
             if sent and states.get(session, {}).get("type", "idle") == "idle":
                 time.sleep(2)
                 if http(base + "/session/status" + query, extra_headers=auth_headers).get(session, {}).get("type", "idle") == "idle":
-                    return {"client": "opencode", "session": session, **verify_fixture(root)}
+                    messages = http(base + "/session/" + session + "/message" + query, extra_headers=auth_headers)
+                    tools = Counter(part.get("tool", "unknown") for message in messages for part in message.get("parts", []) if part.get("type") == "tool")
+                    errors = [message.get("info", {}).get("error", {}).get("name") for message in messages if message.get("info", {}).get("error")]
+                    unexpected = [error for error in errors if not (args.compact and error == "MessageAbortedError")]
+                    assert not unexpected, "OpenCode recorded assistant errors: " + ", ".join(unexpected)
+                    assert not args.compact or compacted, "compaction was not exercised"
+                    return {"client": "opencode", "session": session, "elapsed_seconds": round(time.monotonic()-started_at, 2), "tool_counts": dict(tools), "assistant_errors": errors, "compaction_verified": compacted, "bridge_restarted": args.restart_bridge, "followups_sent": len(suite.followups), "status_question_sent": True, **suite.verify(root)}
             time.sleep(1)
         raise TimeoutError("OpenCode did not finish the multi-task fixture within the test deadline")
     finally:
+        if "session" in locals():
+            try:
+                messages = http(base + "/session/" + session + "/message" + query, extra_headers=auth_headers)
+                diagnostics = [{"role": m.get("info", {}).get("role"), "summary": m.get("info", {}).get("summary"),
+                                "error": m.get("info", {}).get("error"), "parts": [
+                    {"type": p.get("type"), "tool": p.get("tool"), "text": p.get("text"),
+                     "status": p.get("state", {}).get("status"), "error": p.get("state", {}).get("error"),
+                     "plan": p.get("state", {}).get("input") if p.get("tool") == "todowrite" else None}
+                    for p in m.get("parts", [])]} for m in messages]
+                (root.parent / "opencode-events.json").write_text(json.dumps(diagnostics, indent=2).replace(key, "[redacted]"), encoding="utf-8")
+            except Exception:
+                pass
         stop_process(process)
         (root.parent / "opencode-stderr.txt").write_text(safe_diagnostic("\n".join(stderr), key).replace(password, "[redacted]"), encoding="utf-8")
 
@@ -310,7 +353,8 @@ class RPC:
 
 
 def codex_test(args, key, root):
-    fixture(root)
+    suite = fixture_suite(args)
+    suite.create(root)
     # Use the installed sandbox helpers: Codex deliberately refuses to install
     # executable helpers in a CODEX_HOME under Windows Temp. All overrides below
     # are process/thread-local; the user's configuration is never rewritten.
@@ -338,26 +382,44 @@ def codex_test(args, key, root):
         rpc.send("initialized", {}, notification=True)
         thread = rpc.call("thread/start", {"cwd": str(root), "model": args.model, "modelProvider": "m365bridge", "sandbox": "workspace-write", "approvalPolicy": "never", "approvalsReviewer": "user", "ephemeral": True,
             "config": {"projects": {str(root): {"trust_level": "trusted"}}}})["thread"]["id"]
-        turn = rpc.call("turn/start", {"threadId": thread, "input": [{"type": "text", "text": first_prompt(sys.executable)}],
+        turn = rpc.call("turn/start", {"threadId": thread, "input": [{"type": "text", "text": suite.prompt(sys.executable)}],
             "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": [str(root)], "networkAccess": False}, "approvalPolicy": "never"})["turn"]["id"]
         deadline, sent = time.monotonic() + args.timeout, False
+        phase, compacted = "running", False
+        started_at = time.monotonic()
         while time.monotonic() < deadline:
             if not sent and (root / "started").exists():
-                for marker, prompt in FOLLOWUPS:
+                for marker, prompt in suite.followups:
                     (root / marker).touch()
                     rpc.call("turn/steer", {"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": prompt}]})
-                rpc.call("turn/steer", {"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": STATUS_PROMPT}]})
+                rpc.call("turn/steer", {"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": suite.status}]})
                 sent = True
+            if args.compact and sent and not compacted and phase == "running" and (root / "check-runs.jsonl").exists():
+                rpc.call("turn/interrupt", {"threadId": thread, "turnId": turn})
+                phase = "interrupting"
             try:
                 event = rpc.notifications.pop(0) if rpc.notifications else rpc.events.get(timeout=1)
             except queue.Empty:
                 continue
             rpc.observed.append(event)
+            if phase == "compacting" and (event.get("method") == "thread/compacted" or (event.get("method") == "item/completed" and event.get("params", {}).get("item", {}).get("type") == "contextCompaction")):
+                if args.restart_bridge:
+                    args.restart_candidate()
+                turn = rpc.call("turn/start", {"threadId": thread, "input": [{"type": "text", "text": "Resume the unfinished work from the conversation and plan. Retain the queued requirements, and verify the implementation with the unchanged checks."}]})["turn"]["id"]
+                phase, compacted = "running", True
+                continue
             if event.get("method") == "turn/completed" and event.get("params", {}).get("turn", {}).get("id") == turn:
                 status = event["params"]["turn"].get("status")
+                if phase == "interrupting":
+                    rpc.call("thread/compact/start", {"threadId": thread})
+                    phase = "compacting"
+                    continue
                 assert status == "completed", "Codex turn status: " + str(status) + " " + safe_diagnostic(event["params"]["turn"].get("error"), key)
                 assert sent, "Codex ended before the follow-up could be delivered"
-                return {"client": "codex", "thread": thread, **verify_fixture(root)}
+                assert not args.compact or compacted, "compaction was not exercised"
+                completed = {e.get("params", {}).get("item", {}).get("id"): e.get("params", {}).get("item", {}) for e in rpc.observed if e.get("method") == "item/completed"}
+                types = Counter(item.get("type", "unknown") for item in completed.values())
+                return {"client": "codex", "thread": thread, "elapsed_seconds": round(time.monotonic()-started_at, 2), "completed_item_types": dict(types), "compaction_verified": compacted, "bridge_restarted": args.restart_bridge, "followups_sent": len(suite.followups), "status_question_sent": True, **suite.verify(root)}
         raise TimeoutError("Codex did not finish the multi-task fixture within the test deadline")
     finally:
         stop_process(process)
@@ -376,6 +438,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["api", "opencode", "codex", "images", "inspection"], required=True)
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--fixture", choices=["small", "kanban"], default="small")
+    parser.add_argument("--compact", action="store_true", help="Interrupt and compact after the baseline check, then resume the queued work")
+    parser.add_argument("--restart-bridge", action="store_true", help="Restart the candidate after verified compaction and before resuming")
     parser.add_argument("--base-url", default="http://127.0.0.1:8002/v1")
     parser.add_argument("--model", default="gpt-5.6-reasoning")
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -387,30 +452,40 @@ def main():
     parser.add_argument("--catalog", type=Path, default=Path.home() / ".codex/bridge-models.json")
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
+    if args.restart_bridge and not (args.compact and args.bridge_exe):
+        parser.error("--restart-bridge requires --compact and --bridge-exe")
     args.work_dir.mkdir(parents=True, exist_ok=False)
     key = key_from_environment()
-    bridge, report = None, {"mode": args.mode, "model": args.model, "passed": False}
+    bridge, report = None, {"mode": args.mode, "model": args.model, "fixture": args.fixture, "compaction_test": args.compact, "passed": False}
     if args.bridge_exe:
         report["candidate_sha256"] = hashlib.sha256(args.bridge_exe.read_bytes()).hexdigest()
     try:
         if args.bridge_exe:
             environment = os.environ.copy()
             environment["M365_ENABLE_WEB_UI"] = "false"
+            environment["M365_CONTINUITY_DIR"] = str(args.work_dir / "bridge-state")
             if args.mode == "images":
                 environment["M365_BROWSER_IMAGE_ROUTING"] = "1"
             else:
                 environment.pop("M365_BROWSER_IMAGE_ROUTING", None)
             port = str(urllib.parse.urlsplit(args.base_url).port)
-            bridge = subprocess.Popen([str(args.bridge_exe), "serve", "--port", port], cwd=args.bridge_home, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            deadline = time.monotonic() + 20
-            while True:
-                try:
-                    http(args.base_url + "/models", key=key, timeout=2)
-                    break
-                except Exception:
-                    if bridge.poll() is not None or time.monotonic() > deadline:
-                        raise RuntimeError("Candidate bridge did not become ready") from None
-                    time.sleep(0.5)
+            def start_candidate():
+                nonlocal bridge
+                bridge = subprocess.Popen([str(args.bridge_exe), "serve", "--port", port], cwd=args.bridge_home, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.monotonic() + 20
+                while True:
+                    try:
+                        http(args.base_url + "/models", key=key, timeout=2)
+                        return
+                    except Exception:
+                        if bridge.poll() is not None or time.monotonic() > deadline:
+                            raise RuntimeError("Candidate bridge did not become ready") from None
+                        time.sleep(0.5)
+            def restart_candidate():
+                stop_process(bridge)
+                start_candidate()
+            args.restart_candidate = restart_candidate
+            start_candidate()
         if args.mode == "api":
             report["results"] = []
             for protocol in ("chat", "anthropic", "responses"):

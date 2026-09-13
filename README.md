@@ -576,7 +576,7 @@ The choice is stored in the `m365bridge_lang` cookie. A browser with no cookie, 
 
 ### Transcripts
 
-The backend tracks history by conversation ID and never replays it, so the gateway keeps its own record of the turns it carried, one file per session under `data/transcripts`. This is the only place message content reaches disk. Entries per session, bytes per message and files in the store are all bounded.
+The backend tracks history by conversation ID and never replays it, so the gateway keeps its own UI record of the turns it carried, one file per session under `data/transcripts`. Entries per session, bytes per message and files in this store are bounded. [Responses continuity](#retained-responses-and-plan-checkpoints) uses a separate encrypted store with its own retention controls.
 
 A conversation started outside this gateway has no record, so its history is empty when you open it. The interface says so and offers to fetch it, which calls `GET /v1/conversations/{id}/messages`. Deleting a session deletes its transcript, and so does a turn that produced nothing, since both start a new conversation under that id.
 
@@ -672,7 +672,7 @@ Deleting is paired in both directions. `DELETE /v1/conversations/{id}` clears ev
 
 ### System instructions
 
-The M365 backend keeps conversation history itself and receives only the latest turn, so an instruction sent in an earlier message would never reach it. Every `system` message in the request is therefore collected and prefixed to that turn, and kept out of the flattened history where it would otherwise read as a past conversation line.
+The M365 backend keeps conversation history itself and receives only the latest turn. Plain chat therefore collects and prefixes system instructions to that turn. Client-tool requests instead send one canonical request containing the complete supplied history, tools, instructions and result batch. This also works when the M365 conversation is reused, so parallel results and tool definitions cannot disappear behind the last result.
 
 `developer` is treated identically. OpenAI renamed the role for its reasoning models and both names remain valid, so a client sending either reaches the model the same way.
 
@@ -688,6 +688,8 @@ Anthropic's top-level `system` field is accepted as a string or as an array of t
 | `POST /v1/responses/compact`          | OpenAI Responses Compact, for Codex remote compaction  |
 | `POST /v1/messages`                   | Anthropic Messages, with dedicated SSE handlers        |
 | `POST /v1/messages/count_tokens`      | Anthropic input token counting                         |
+| `GET /v1/responses/{id}`              | Retrieve a retained Responses result for this credential |
+| `DELETE /v1/responses/{id}`           | Delete a retained Responses result                     |
 | `POST /v1/complete`                   | Anthropic Complete                                     |
 | `POST /v1/images/generations`         | Generate an image from text                            |
 | `POST /v1/images/edits`               | Edit an existing image                                 |
@@ -1030,7 +1032,7 @@ curl http://127.0.0.1:8000/v1/messages \
 
 ### Client-driven tool loops
 
-Agent clients such as Claude Code and Codex drive the tool loop themselves and resend the whole call and result history on every request. The proxy holds no state between those requests, so it rebuilds the evidence of the current turn from the incoming history. A turn starts at the last user message carrying no tool result, which keeps the Anthropic shape, where every result arrives as a user message, from looking like a new turn.
+Agent clients such as Claude Code and Codex drive the tool loop themselves. The proxy rebuilds execution evidence from supplied history (or restored Responses history) and can retain a bounded checkpoint of acknowledged plans. A turn starts at the last user message carrying no tool result, which keeps the Anthropic shape, where every result arrives as a user message, from looking like a new turn. File changes, command execution and verification remain owned by the client when built-in coding tools are disabled.
 
 | Variable                 | Default | Description                                                                                        |
 |--------------------------|---------|----------------------------------------------------------------------------------------------------|
@@ -1069,14 +1071,17 @@ completion, `tool_choice=none`, and a final answer beginning with `Blocked:` are
 honored. Responses goal markers similarly survive an ordinary follow-up and close
 on a completed/blocked/cancelled goal or an explicit standalone cancellation.
 
-The bridge uses the history the client supplies; it cannot recover a plan the
-client has removed during compaction. Clients without planning tools still receive
+The bridge combines supplied history with an encrypted checkpoint when the client
+consistently sends an explicit session ID. This lets acknowledged plans survive
+client compaction, reconnects and bridge restarts within the retention limits below.
+Responses compaction also carries its checkpoint in an authenticated client-held
+capsule. Clients without planning tools still receive
 the shared execution/verification instructions and progress-aware loop protection.
 Plan status is evidence reported by the client, not independent proof that code
 or tests are correct.
 
 `scripts/verify-continuity.py` provides opt-in live checks using disposable fixtures.
-The native OpenCode and Codex tests send second, third and fourth bug-fix requests
+The native OpenCode and Codex tests send second, third and fourth requests
 plus a status question while the initial failing check is running, require all
 four fixes, and independently verify the result
 without allowing the agent to alter the acceptance checks. The API mode checks
@@ -1088,7 +1093,55 @@ python scripts/verify-continuity.py --mode api --base-url http://localhost:8000/
 
 The harness reads `M365BRIDGE_API_KEY` from the process or Windows user environment.
 It does not rewrite a client's installed configuration. Native test overrides are
-limited to the test process/thread and its disposable workspace.
+limited to the test process/thread and its disposable workspace. `--fixture kanban`
+creates a multi-file SQLite/WSGI project with 20 fixed acceptance checks.
+`--compact --restart-bridge --bridge-exe <candidate.exe>` interrupts after the first
+failing check, verifies a real client compaction, restarts the isolated candidate,
+and resumes the same work. See [the measured results and exact test scope](docs/protocol-continuity-validation.md).
+
+### Retained Responses and plan checkpoints
+
+`POST /v1/responses` defaults to `store:true`. Send `previous_response_id` with only
+the new input to restore the earlier input/output chain. The current request still
+owns its instructions and tool definitions. `GET` and `DELETE /v1/responses/{id}`
+operate on the same retained record. Missing, expired, deleted or other-credential
+IDs return `404 response_not_found`; deletion/eviction of an ancestor also makes a
+dependent chain unavailable. Send the complete client history or compact before
+reaching the chain limit. A failed or cancelled turn is never retained as a success.
+
+Chat Completions and Anthropic Messages checkpoint only acknowledged plans and only
+with an explicit session identifier on each request. The extension `store:false`
+disables these writes; Responses `store:false` also disables response retention.
+The `user` field alone does not identify a checkpoint session.
+
+| Setting / bound | Value |
+|-----------------|-------|
+| `M365_CONTINUITY_DIR` | `data/continuity` relative to the working directory |
+| `M365_STORE_CONTINUITY` | `true`; set exactly `false` to disable retained responses/checkpoints globally |
+| Expiry | 24 hours; an updated plan checkpoint renews its expiry |
+| Record / reconstructed history | 8 MiB |
+| Shared disk budget | 64 MiB, 256 records; oldest responses evicted first |
+| Response chain / acknowledged plan events | 128 ancestors / 4096 events per checkpoint |
+
+Records use AES-GCM with a local `state.key`, atomic replacement and an OS file
+lock shared by bridge processes. Preserve that key across upgrades/restarts. The
+retention opt-out still allows encrypted client-held compaction capsules and may
+create the key, but does not retain their message payload server-side. Capacity
+errors are explicit (`413 continuity_capacity`); unavailable/corrupt local state
+returns `503 continuity_unavailable` without disclosing local paths.
+
+Scopes are derived from the validated API credential. Reuse the same credential
+and session for continuation; a shared key shares that scope. Anonymous access has
+one anonymous scope. Session listings and UI transcript lookup follow the same
+scoping. Legacy unowned mappings remain accessible on single-credential installs;
+multi-credential installs must explicitly bind/import them into the correct scope.
+All credentials still use the configured Microsoft account for upstream services.
+
+UI transcripts remain a separate store controlled by `M365_ENABLE_WEB_UI`.
+`store:false` does not disable UI transcripts. To disable both kinds of server-side
+message retention, set `M365_STORE_CONTINUITY=false` and `M365_ENABLE_WEB_UI=false`.
+Recovery depends on retained state or client-supplied context; these bounds do not
+provide unlimited memory or independent proof that the client's work is correct.
 
 ## Built-in coding tools (opt-in)
 
@@ -1214,6 +1267,7 @@ curl http://127.0.0.1:8000/v1/responses \
 | `response.function_call_arguments.delta` | Tool call arguments delta                                    |
 | `response.function_call_arguments.done`  | Tool call arguments complete                                 |
 | `response.completed`                     | Full response object, status `completed`                     |
+| `response.incomplete`                    | Output budget exhausted; `incomplete_details` explains why   |
 | `response.failed`                        | An error occurred, status `failed`                           |
 
 ### Codex compatibility
@@ -1235,7 +1289,9 @@ Two more rules protect a stream whose client went away. Each frame arms a thirty
 
 1. The conversation history is flattened into a single user message carrying a compaction prompt.
 2. That message goes to Copilot, which produces a concise summary.
-3. The summary is returned wrapped in a `compaction` output item under `encrypted_content`.
+3. The summary, original user messages, pending task queue, open/closed goal state,
+   unmatched tool calls and loaded tool definitions are sealed in a credential-bound
+   `compaction` item. Return this opaque item unchanged on the next request.
 
 ```bash
 curl http://127.0.0.1:8000/v1/responses/compact \
@@ -1254,19 +1310,24 @@ curl http://127.0.0.1:8000/v1/responses/compact \
 ```json
 {
   "id": "resp_...",
-  "object": "response",
+  "object": "response.compaction",
   "status": "completed",
   "output": [{
     "id": "cmp_...",
     "type": "compaction",
-    "encrypted_content": "The conversation focused on fixing an SSO auth bug..."
+    "encrypted_content": "m365cp1.<opaque-authenticated-capsule>"
   }]
 }
 ```
 
 Streaming mode emits the same event sequence as `/v1/responses`, but the output item carries `type: "compaction"` instead of `type: "message"`.
 
-Custom `instructions` in the request body override the default compaction prompt. Use a new session ID rather than reusing an existing conversation, which gives better results.
+Custom `instructions` override the summary prompt. Keep the client's session ID:
+the bridge uses a fresh upstream conversation for summarization automatically.
+In-band `compaction_trigger` requests on `/v1/responses` return an ordinary
+`response` object with a compaction item; the dedicated compact endpoint returns
+`response.compaction`. Empty, disconnected or truncated summaries fail explicitly.
+Tampered, expired or wrong-credential/session capsules return `400 invalid_compaction`.
 
 ## Image input
 
@@ -1420,7 +1481,8 @@ pkg/
     mcp.go                 # JSON-RPC 2.0 Model Context Protocol server
     sessions.go            # The session-to-conversation mapping routes
     stopsequence.go        # Stop sequence cutting, including the streaming writer
-    transcripts.go         # The only place message content reaches disk
+    transcripts.go         # Optional UI transcripts
+    continuity_store.go    # Encrypted bounded Responses/plan continuity
     webui.go               # Serves the embedded browser interface
   setup/wizard.go          # Setup wizard: browser snippet, token verification, data/.env
   textcut/                 # Rune-boundary-safe cutting

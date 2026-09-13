@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, 'integrate/**']
+    branches: [main, master, 'integrate/**', 'feature/protocol-continuity']
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -67,6 +67,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install official SDK contract dependencies
+        run: |
+          python -m venv .sdk-venv
+          .sdk-venv/bin/python -m pip install -r tests/sdk-requirements.txt
+
       - name: Gofmt
         run: |
           unformatted="$(gofmt -l cmd pkg)"
@@ -81,6 +90,7 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: 1
+          M365_SDK_PYTHON: ${{ github.workspace }}/.sdk-venv/bin/python
         run: go test ./... -count=1 -race
 
   modernize:

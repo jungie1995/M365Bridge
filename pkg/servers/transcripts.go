@@ -23,8 +23,8 @@ import (
 // interface needs exactly that, which is why the gateway keeps its own record
 // of the turns it carried.
 //
-// This store is deliberately the only place message content reaches disk, and
-// it stays switched off unless the interface is enabled.
+// UI transcripts stay switched off unless the interface is enabled. Responses
+// continuity has a separate encrypted, bounded store and respects store=false.
 
 const (
 	// transcriptDir is the directory for per-session transcripts.
@@ -236,7 +236,7 @@ func (api *APIServer) recordUserTurn(sid string, messages []payload.Message) {
 	if api.transcripts == nil || sid == "" {
 		return
 	}
-	api.transcripts.Append(sid, TranscriptEntry{Role: "user", Content: lastUserMessage(messages)})
+	api.transcripts.Append(sid, TranscriptEntry{Role: "user", Content: lastUserMessage(simulationHistory(messages))})
 }
 
 // recordAssistantTurn stores the answer the backend produced.

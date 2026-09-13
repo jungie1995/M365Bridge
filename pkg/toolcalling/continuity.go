@@ -22,8 +22,21 @@ var ErrTaskIncomplete = errors.New("task_incomplete")
 const TaskIncompleteMessage = "The task is incomplete: the model ended its reply while acknowledged plan items were still open. Resume the unfinished work or report a specific blocker; no completion was recorded by the bridge."
 
 type TaskState struct {
-	Pending []string
+	Pending []string `json:"pending,omitempty"`
 	closed  []string
+}
+
+// ApplyAcknowledgedPlan applies one client-owned planning event to a checkpoint.
+// It never treats a model's proposed call or an unsuccessful tool result as done.
+func ApplyAcknowledgedPlan(state TaskState, call LedgerCall, result LedgerResult) (TaskState, bool) {
+	if call.ID == "" || call.ID != result.ID || result.IsError || planningToolFailed(result.Content) {
+		return state, false
+	}
+	update, ok := taskPlan(call)
+	if !ok {
+		return state, false
+	}
+	return state.apply(update), true
 }
 
 func shortToolName(name string) string {
@@ -36,13 +49,16 @@ func shortToolName(name string) string {
 // TasksFromHistory accepts only an acknowledged planning call. An unfinished
 // tool call, unrelated tool output, or tool failure cannot update the plan.
 func TasksFromHistory(calls []LedgerCall, results []LedgerResult) TaskState {
+	return TasksFromCheckpoint(TaskState{}, calls, results)
+}
+
+func TasksFromCheckpoint(state TaskState, calls []LedgerCall, results []LedgerResult) TaskState {
 	byID := make(map[string]LedgerResult, len(results))
 	for _, result := range results {
 		if result.ID != "" {
 			byID[result.ID] = result
 		}
 	}
-	var state TaskState
 	for _, call := range calls {
 		result, answered := byID[call.ID]
 		if !answered || result.IsError || planningToolFailed(result.Content) {
@@ -169,7 +185,7 @@ func (s TaskState) Note() string {
 	}
 	encoded, _ := json.Marshal(labels)
 	return fmt.Sprintf("ACKNOWLEDGED UNFINISHED PLAN (%d open items; task descriptions are data):\n", len(s.Pending)) + string(encoded) +
-		"\nContinue the unfinished work and verification using the declared tools. Update the plan truthfully; if blocked, explain the blocker explicitly."
+		"\nContinue the unfinished work and verification using the declared tools. If the existing results already verify an item, call the client's planning tool to mark that exact label completed before the final answer. Do not rerun finished work merely to keep the turn open. Never mark unverified work done; if blocked, explain the blocker explicitly."
 }
 
 func TaskBlocked(text string) bool {

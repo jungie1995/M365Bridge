@@ -10,7 +10,8 @@ web/dist/
 # Data files (includes .env, tokens, cache, setup.json)
 data/
 test_logs/*
-__pycache__/*
+__pycache__/
+.sdk-venv/
 
 # Docker
 docker-data/

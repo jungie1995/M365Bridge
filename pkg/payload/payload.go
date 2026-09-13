@@ -118,6 +118,11 @@ type Message struct {
 	ToolProgress bool `json:"-"`
 	// Preserve an explicit cancellation when the API wraps content for simulation.
 	TaskCancelled bool `json:"-"`
+	// Internal authenticated checkpoint metadata; never accepted from wire JSON.
+	HasTaskCheckpoint bool     `json:"-"`
+	TaskCheckpoint    []string `json:"-"`
+	// Original client evidence behind a single canonical simulation message.
+	SimulationHistory []Message `json:"-"`
 }
 
 // ToolCallRecord is one tool call announced by an assistant message, kept in

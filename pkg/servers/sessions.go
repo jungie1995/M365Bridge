@@ -7,6 +7,7 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
+	"github.com/google/uuid"
 )
 
 // Conversation continuity runs through a session id that the caller either
@@ -29,6 +30,13 @@ func (api *APIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 	records, legacy := api.ctxCache.List()
 	data := make([]map[string]any, 0, len(records))
 	for _, record := range records {
+		if api.continuity != nil {
+			id, ok := api.visibleSessionID(r, record.SessionID)
+			if !ok {
+				continue
+			}
+			record.SessionID = id
+		}
 		data = append(data, sessionJSON(record))
 	}
 	api.sendJSON(w, http.StatusOK, map[string]any{
@@ -53,6 +61,8 @@ func (api *APIServer) handleSession(w http.ResponseWriter, r *http.Request) {
 		api.sendError(w, http.StatusNotFound, "Session not found")
 		return
 	}
+	publicID := sessionID
+	sessionID = api.sessionCacheID(r, sessionID)
 	if sub != "" {
 		if sub != "messages" {
 			api.sendError(w, http.StatusNotFound, "Session not found")
@@ -69,6 +79,7 @@ func (api *APIServer) handleSession(w http.ResponseWriter, r *http.Request) {
 			api.sendError(w, http.StatusNotFound, "Session not found")
 			return
 		}
+		record.SessionID = publicID
 		api.sendJSON(w, http.StatusOK, sessionJSON(record))
 	case http.MethodPut:
 		api.bindSession(w, r, sessionID)
@@ -115,7 +126,7 @@ func (api *APIServer) handleSessionMessages(w http.ResponseWriter, r *http.Reque
 	}
 	api.sendJSON(w, http.StatusOK, map[string]any{
 		"object":     "list",
-		"session_id": sessionID,
+		"session_id": api.displaySessionID(r, sessionID),
 		"data":       data,
 	})
 }
@@ -159,6 +170,7 @@ func (api *APIServer) bindSession(w http.ResponseWriter, r *http.Request, sessio
 		api.sendError(w, http.StatusInternalServerError, "Failed to store the session mapping")
 		return
 	}
+	record.SessionID = api.displaySessionID(r, record.SessionID)
 	api.sendJSON(w, http.StatusOK, sessionJSON(record))
 }
 
@@ -190,14 +202,69 @@ func (api *APIServer) deleteSession(w http.ResponseWriter, r *http.Request, sess
 		api.dropSessionsFor(record.ConversationID)
 	}
 
+	if api.continuity != nil && api.continuity.retain {
+		if public, ok := api.visibleSessionID(r, sessionID); ok {
+			_, err := api.continuity.checkpoint(r.Context(), api.callerScope(r), public, checkpointUpdate{cancellationID: "reset-" + uuid.NewString()})
+			if err != nil {
+				api.sendContinuityError(w, err)
+				return
+			}
+		}
+	}
 	api.ctxCache.Delete(sessionKeyPrefix + sessionID)
 	api.dropTranscript(sessionID)
 	api.sendJSON(w, http.StatusOK, map[string]any{
 		"object":                "session.deleted",
-		"id":                    sessionID,
+		"id":                    api.displaySessionID(r, sessionID),
 		"conversation_id":       record.ConversationID,
 		"upstream_conversation": map[string]any{"deleted": !localOnly},
 	})
+}
+
+// Legacy mappings have no owner. They remain usable on a single-credential
+// installation; a multi-credential installation must explicitly bind/import
+// them under its own credential rather than guessing their owner.
+func (api *APIServer) legacySessionsVisible() bool {
+	keys := map[string]bool{}
+	for _, key := range api.config.APIKeys {
+		if key != "" {
+			keys[key] = true
+		}
+	}
+	if api.config.WebUIPassword != "" {
+		keys[api.config.WebUIPassword] = true
+	}
+	return len(keys) <= 1
+}
+
+func (api *APIServer) visibleSessionID(r *http.Request, id string) (string, bool) {
+	if public, ok := publicSessionID(api.callerScope(r), id); ok {
+		return public, true
+	}
+	return id, !strings.HasPrefix(id, "sc1.") && api.legacySessionsVisible()
+}
+
+func (api *APIServer) sessionCacheID(r *http.Request, id string) string {
+	if api.continuity == nil {
+		return id
+	}
+	scoped := scopedSessionID(api.callerScope(r), id)
+	if api.ctxCache.Get(sessionKeyPrefix+scoped) != "" {
+		return scoped
+	}
+	if !strings.HasPrefix(id, "sc1.") && api.legacySessionsVisible() && api.ctxCache.Get(sessionKeyPrefix+id) != "" {
+		return id
+	}
+	return scoped
+}
+
+func (api *APIServer) displaySessionID(r *http.Request, id string) string {
+	if api.continuity != nil {
+		if public, ok := publicSessionID(api.callerScope(r), id); ok {
+			return public
+		}
+	}
+	return id
 }
 
 // sessionJSON renders one mapping for the wire.

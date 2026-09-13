@@ -1,0 +1,2 @@
+openai==3.13.0
+anthropic==1.5.0

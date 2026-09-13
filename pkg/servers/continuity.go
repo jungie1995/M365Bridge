@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,10 +38,10 @@ func continuationRepairNote(sim toolcalling.SimulatedResult, messages []payload.
 	return repairNote(sim, tools, contracts, rawText)
 }
 
-func (api *APIServer) checkedSimulation(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, choice string, noParallel bool, text string) (toolcalling.SimulatedResult, error) {
+func (api *APIServer) checkedSimulation(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, choice string, noParallel bool, text string, contexts ...context.Context) (toolcalling.SimulatedResult, error) {
 	contracts := toolcalling.ContractsFor(tools).WithChoice(choice).WithoutParallel(noParallel)
 	sim := parseLoopSimulation(provider, text, tools, contracts)
-	sim = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, sim)
+	sim = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, sim, contexts...)
 	return guardToolProgress(buildToolLedger(messages), choice, sim)
 }
 
@@ -80,14 +81,39 @@ func latestUserCancelsTasks(messages []payload.Message) bool {
 }
 
 func taskHistorySinceCancellation(messages []payload.Message) []payload.Message {
-	start := 0
+	return messages[taskCancellationIndex(messages)+1:]
+}
+
+func taskCancellationIndex(messages []payload.Message) int {
+	last := -1
 	for index, message := range messages {
 		if message.Role == "user" && len(message.ToolResults) == 0 && !message.ToolProgress &&
 			(message.TaskCancelled || toolcalling.TaskCancellation(message.Content)) {
-			start = index + 1
+			last = index
 		}
 	}
-	return messages[start:]
+	return last
+}
+
+func historyAfterCheckpoint(messages []payload.Message) ([]payload.Message, toolcalling.TaskState) {
+	var initial toolcalling.TaskState
+	start := 0
+	for i, message := range messages {
+		if message.HasTaskCheckpoint {
+			initial.Pending = append([]string(nil), message.TaskCheckpoint...)
+			start = i + 1
+		}
+	}
+	return messages[start:], initial
+}
+
+func attachTaskCheckpoint(messages []payload.Message, state toolcalling.TaskState) {
+	if len(messages) == 0 {
+		return
+	}
+	last := &messages[len(messages)-1]
+	last.HasTaskCheckpoint = true
+	last.TaskCheckpoint = append([]string(nil), state.Pending...)
 }
 
 // guardToolProgress never synthesizes a successful completion from blocked
