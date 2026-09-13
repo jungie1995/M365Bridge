@@ -12,6 +12,7 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
 )
 
 // OpenAI's error body carries a category in "type" and a machine-readable
@@ -95,6 +96,10 @@ func (api *APIServer) sendRequestBodyError(w http.ResponseWriter, err error) {
 // own bug as a backend outage would send the client into a pointless retry.
 func classifyUpstreamError(err error) (int, string) {
 	switch {
+	case errors.Is(err, toolcalling.ErrToolLoopStalled):
+		return http.StatusConflict, "tool_loop_stalled"
+	case errors.Is(err, toolcalling.ErrTaskIncomplete):
+		return http.StatusConflict, "task_incomplete"
 	case errors.Is(err, auth.ErrTokenNotFound), errors.Is(err, auth.ErrRefreshFailed):
 		return http.StatusUnauthorized, upstreamAuthFailedCode
 	case errors.Is(err, context.DeadlineExceeded):
@@ -144,6 +149,10 @@ func classifyUpstreamError(err error) (int, string) {
 // upstreamErrorMessage states what failed without quoting the transport error.
 func upstreamErrorMessage(op, code string) string {
 	switch code {
+	case "tool_loop_stalled":
+		return toolcalling.ToolLoopStalledMessage
+	case "task_incomplete":
+		return toolcalling.TaskIncompleteMessage
 	case upstreamAuthFailedCode:
 		return "M365 authentication failed; the stored credentials could not be used for this " + op + " request"
 	case upstreamForbiddenCode:

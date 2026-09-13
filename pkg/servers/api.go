@@ -1372,9 +1372,10 @@ func replaceRequestTools(body []byte, tools []toolcalling.ToolDef) string {
 // loop feeds therefore do not store the mapping again.
 func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, sid, convID string, tools []toolcalling.ToolDef, noParallel bool, local map[string]bool) (toolLoopResult, error) {
 	currentConvID := convID
-	seen := make(map[string]bool)
+	var executed []toolcalling.LedgerCall
+	var observed []toolcalling.LedgerResult
 	for iteration := 0; ; iteration++ {
-		text, thinking, backendCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, currentConvID, api.config.UserOID, api.config.TenantID, len(tools) > 0)
+		text, thinking, backendCalls, finishReason, finalConvID, err := api.m365Client.ChatConversationContext(r.Context(), messages, cfg.Tone, cfg.Override, currentConvID, api.config.UserOID, api.config.TenantID, len(tools) > 0)
 		if err != nil {
 			return toolLoopResult{conversationID: currentConvID}, err
 		}
@@ -1396,6 +1397,12 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 			simulated = toolcalling.ParseSimulatedResponse(text, toolNamesFromDefs(tools), contracts)
 		}
 		simulated = api.repairSimulatedToolCalls(provider, messages, cfg, tools, contracts, text, simulated)
+		progress := toolcalling.BuildLedger(executed, observed, iteration)
+		progress.Tasks = buildToolLedger(messages).Tasks
+		simulated, progressErr := guardToolProgress(progress, "auto", simulated)
+		if progressErr != nil {
+			return toolLoopResult{conversationID: currentConvID}, progressErr
+		}
 		if !simulated.HasPayload || len(simulated.ToolCalls) == 0 {
 			if simulated.HasPayload {
 				text, finishReason = simulated.Content, "stop"
@@ -1419,15 +1426,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 			return toolLoopResult{conversationID: currentConvID}, errors.New("coding tool iteration limit reached")
 		}
 		var resultParts []string
-		for _, call := range localCalls {
-			// The arguments are normalized before they identify a call, because
-			// a model that re-emits the same call with its JSON keys in another
-			// order is repeating it, not asking something new.
-			key := toolcalling.CallSignature(call.Name, string(call.Arguments))
-			if seen[key] {
-				return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("duplicate coding tool call %q", call.Name)
-			}
-			seen[key] = true
+		for index, call := range localCalls {
 			var arguments map[string]any
 			if err := json.Unmarshal(call.Arguments, &arguments); err != nil {
 				arguments = map[string]any{}
@@ -1436,6 +1435,11 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 			if err != nil {
 				return toolLoopResult{conversationID: currentConvID}, fmt.Errorf("serialize coding tool result: %w", err)
 			}
+			// Internal evidence ids remain unique even if the simulated backend
+			// reuses a wire id on a later iteration.
+			evidenceID := fmt.Sprintf("local-%d-%d", iteration, index)
+			executed = append(executed, toolcalling.LedgerCall{ID: evidenceID, Name: call.Name, Arguments: string(call.Arguments)})
+			observed = append(observed, toolcalling.LedgerResult{ID: evidenceID, Content: string(encoded)})
 			resultParts = append(resultParts, toolcalling.FormatSimulatedToolResult(call.ID, call.Name, string(encoded)))
 		}
 		messages = append(messages, payload.Message{Role: "user", Content: strings.Join(resultParts, "\n\n")})
@@ -1461,13 +1465,20 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 // returns the recovered result when the backend supplies valid tool calls, and
 // the original result otherwise so callers keep their existing fallback path.
 func (api *APIServer) repairSimulatedToolCalls(provider toolLoopProvider, messages []payload.Message, cfg models.ModelConfig, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string, sim toolcalling.SimulatedResult) toolcalling.SimulatedResult {
+	if !sim.HasPayload && sim.Content == "" {
+		sim.Content = rawText
+	}
 	if len(sim.ToolCalls) > 0 || len(messages) == 0 || len(tools) == 0 {
 		return sim
 	}
 
 	var note string
 	narrated := false
+	ledger := buildToolLedger(messages)
 	switch {
+	case ledger.Tasks.Unfinished() && !toolcalling.TaskBlocked(sim.Content):
+		note = toolcalling.TaskContinuityInstruction + "\n" + ledger.Tasks.Note()
+		logging.Warn("repairSimulatedToolCalls: requesting continuation of an acknowledged unfinished plan")
 	case len(sim.DroppedCalls) > 0:
 		note = toolcalling.BuildRepairNote(sim.DroppedCalls, contracts)
 		logging.Warnf("repairSimulatedToolCalls: re-asking backend, tool calls failed validation: %v", sim.DroppedCalls)
@@ -2312,7 +2323,12 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
 		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendSSEError(w, "tool execution", chunkID, openaiModel, progressErr)
+			flusher.Flush()
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -2519,7 +2535,11 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
 		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendUpstreamError(w, "tool execution", progressErr)
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -2830,7 +2850,11 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
 		sim := toolcalling.ParseSimulatedResponseAnthropic(fullText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, fullText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendAnthropicProgressError(w, progressErr)
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -3071,7 +3095,11 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice).WithoutParallel(noParallel)
 		sim := toolcalling.ParseSimulatedResponseAnthropic(respText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopAnthropic, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendUpstreamError(w, "tool execution", progressErr)
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -3311,7 +3339,12 @@ func (api *APIServer) streamCompletions(ctx context.Context, w http.ResponseWrit
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
 		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, fullText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendSSEError(w, "tool execution", compID, openaiModel, progressErr, "text_completion")
+			flusher.Flush()
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				simToolCalls = sim.ToolCalls
@@ -3416,7 +3449,11 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 		contracts := toolcalling.ContractsFor(tools).WithChoice(toolChoice)
 		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools), contracts)
 		sim = api.repairSimulatedToolCalls(toolLoopOpenAI, messages, cfg, tools, contracts, respText, sim)
-		sim = dropSettledToolCalls(buildToolLedger(messages), toolChoice, sim)
+		sim, progressErr := guardToolProgress(buildToolLedger(messages), toolChoice, sim)
+		if progressErr != nil {
+			api.sendUpstreamError(w, "tool execution", progressErr)
+			return
+		}
 		if sim.HasPayload {
 			if len(sim.ToolCalls) > 0 {
 				finishReason = "tool_calls"
@@ -3609,11 +3646,15 @@ func (api *APIServer) sendSSEDone(w http.ResponseWriter, chunkID, model, finishR
 // way to tell a failure from a reply. OpenAI puts an error object on the data
 // line instead, which is what a client checks for. [DONE] still follows, so a
 // reader waiting for the terminator does not hang.
-func (api *APIServer) sendSSEError(w http.ResponseWriter, op, chunkID, model string, err error) {
+func (api *APIServer) sendSSEError(w http.ResponseWriter, op, chunkID, model string, err error, objectType ...string) {
 	status, code, message := streamErrorFields(op, err)
+	object := "chat.completion.chunk"
+	if len(objectType) > 0 {
+		object = objectType[0]
+	}
 	body := map[string]any{
 		"id":      chunkID,
-		"object":  "chat.completion.chunk",
+		"object":  object,
 		"created": time.Now().Unix(),
 		"model":   model,
 		"error": map[string]any{
@@ -4030,6 +4071,7 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice,
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice, evidence)
 	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
+			(*messages)[i].TaskCancelled = latestUserCancelsTasks(*messages)
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
 				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
@@ -4046,7 +4088,7 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice,
 func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice, evidence string) {
 	requestJSON = responsesPromptWithoutImageBytes(requestJSON)
 	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice, evidence)
-	canonical := payload.Message{Role: "user", Content: prompt}
+	canonical := payload.Message{Role: "user", Content: prompt, TaskCancelled: latestUserCancelsTasks(*messages)}
 	for _, message := range *messages {
 		canonical.Images = append(canonical.Images, message.Images...)
 		canonical.Annotations = append(canonical.Annotations, message.Annotations...)
@@ -4107,6 +4149,7 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice, evidence)
 	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
+			(*messages)[i].TaskCancelled = latestUserCancelsTasks(*messages)
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
 				suffix = "\n\nCURRENT USER MESSAGE\n" + currentUserMessage
@@ -4251,29 +4294,15 @@ func activeToolMessages(messages []payload.Message) []payload.Message {
 // incoming history is the only record of what already ran.
 func buildToolLedger(messages []payload.Message) toolcalling.Ledger {
 	active := activeToolMessages(messages)
-
-	var calls []toolcalling.LedgerCall
-	var results []toolcalling.LedgerResult
-	rounds := 0
-	for i := range active {
-		if len(active[i].ToolCalls) > 0 {
-			rounds++
-		}
-		for _, call := range active[i].ToolCalls {
-			calls = append(calls, toolcalling.LedgerCall{
-				ID:        call.ID,
-				Name:      call.Name,
-				Arguments: call.Arguments,
-			})
-		}
-		for _, result := range active[i].ToolResults {
-			results = append(results, toolcalling.LedgerResult{
-				ID:      result.ID,
-				Content: result.Content,
-			})
-		}
+	calls, results, rounds := messageToolHistory(active)
+	ledger := toolcalling.BuildLedger(calls, results, rounds)
+	// Round counting resets at a new user request; unfinished work does not.
+	allCalls, allResults, _ := messageToolHistory(taskHistorySinceCancellation(messages))
+	ledger.Tasks = toolcalling.TasksFromHistory(allCalls, allResults)
+	if latestUserCancelsTasks(messages) {
+		ledger.Tasks = toolcalling.TaskState{}
 	}
-	return toolcalling.BuildLedger(calls, results, rounds)
+	return ledger
 }
 
 // toolChoiceForcesACall reports whether the caller demanded a tool call in this
@@ -4285,37 +4314,6 @@ func toolChoiceForcesACall(toolChoice string) bool {
 	default:
 		return true
 	}
-}
-
-// dropSettledToolCalls removes a tool call the model is issuing for at least
-// the third time with the same arguments, whose result is already in this
-// turn's history.
-//
-// A call the caller demanded through tool_choice is forwarded regardless:
-// refusing it would contradict the request. The drop is not recorded in
-// DroppedCalls either, because that list drives a corrective re-ask and
-// re-asking would produce the same call again. When nothing survives, the turn
-// becomes a plain answer, which needs substitute text because the parser clears
-// the content whenever tool calls are present.
-func dropSettledToolCalls(ledger toolcalling.Ledger, toolChoice string, sim toolcalling.SimulatedResult) toolcalling.SimulatedResult {
-	if len(sim.ToolCalls) == 0 || toolChoiceForcesACall(toolChoice) {
-		return sim
-	}
-	kept, dropped := ledger.FilterRepeated(sim.ToolCalls)
-	if len(dropped) == 0 {
-		return sim
-	}
-	for _, call := range dropped {
-		logging.Warnf("dropSettledToolCalls: dropping %q, its result is already in this turn's history", call.Name)
-	}
-	sim.ToolCalls = kept
-	if len(kept) == 0 {
-		sim.FinishReason = "stop"
-		if strings.TrimSpace(sim.Content) == "" {
-			sim.Content = toolcalling.RepeatedCallsNotice
-		}
-	}
-	return sim
 }
 
 // toolRoundLimitCode marks a client-driven tool loop that ran past its cap.
@@ -4842,7 +4840,14 @@ func parseResponsesSimulation(text string, policy responsesToolPolicy) (response
 		}
 	}
 	if !policy.required {
-		simulated = dropSettledToolCalls(policy.ledger, "", simulated)
+		if !simulated.HasPayload {
+			simulated.Content = toolcalling.WithholdTransportEnvelope(text)
+		}
+		var progressErr error
+		simulated, progressErr = guardToolProgress(policy.ledger, policy.promptChoice, simulated)
+		if progressErr != nil {
+			return responsesSimulationResult{}, progressErr
+		}
 	}
 	if simulated.HasPayload {
 		result.content = simulated.Content
@@ -4904,7 +4909,7 @@ func parseResponsesSimulationWithRetry(
 		return parseResponsesSimulation(retryText, policy)
 	}
 	if requiredRetry == nil ||
-		!errors.Is(err, errSimulatedToolCallRequired) {
+		!retryableSimulationFailure(err) {
 		return result, err
 	}
 
@@ -4913,12 +4918,12 @@ func parseResponsesSimulationWithRetry(
 		if retryErr != nil {
 			return responsesSimulationResult{}, fmt.Errorf(
 				"%w: retry failed: %v",
-				errSimulatedToolCallRequired,
+				err,
 				retryErr,
 			)
 		}
 		result, err = parseResponsesSimulation(retryText, policy)
-		if err == nil || !errors.Is(err, errSimulatedToolCallRequired) {
+		if err == nil || !retryableSimulationFailure(err) {
 			return result, err
 		}
 	}
@@ -4930,7 +4935,9 @@ func responsesSimulationRetryMessages(
 	policy responsesToolPolicy,
 ) []payload.Message {
 	retryInstruction := "RETRY: The previous result was invalid. "
-	if policy.requiredName != "" {
+	if !policy.required {
+		retryInstruction = "The task has not completed. Continue with an appropriate tool call that makes progress; use existing results rather than looping on unchanged operations. If genuinely blocked, begin the answer with Blocked: and explain the missing input.\n" + policy.ledger.Tasks.Note()
+	} else if policy.requiredName != "" {
 		retryInstruction += fmt.Sprintf(
 			"Return exactly one valid tool call named %q inside the required chat-completion JSON envelope. Plain content is invalid.",
 			policy.requiredName,
@@ -5901,8 +5908,9 @@ func responsesGoalContinuationOpen(input any) bool {
 		return false
 	}
 
-	// Only the latest user item counts. A later user item without the marker
-	// is a new request, and its turn is not part of the earlier goal.
+	// Follow-up instructions do not silently close an unfinished goal. The
+	// client's acknowledged completion/blocker/cancellation or explicit user
+	// cancellation closes it; a newer goal marker starts a fresh goal scope.
 	goalItem := -1
 	for index, item := range items {
 		record, ok := item.(map[string]any)
@@ -5911,7 +5919,7 @@ func responsesGoalContinuationOpen(input any) bool {
 		}
 		if strings.Contains(responsesExtractContent(record["content"]), goalContextMarker) {
 			goalItem = index
-		} else {
+		} else if toolcalling.TaskCancellation(responsesExtractContent(record["content"])) {
 			goalItem = -1
 		}
 	}
@@ -5961,7 +5969,7 @@ func responsesGoalContinuationOpen(input any) bool {
 		if json.Unmarshal([]byte(output), &report) != nil {
 			continue
 		}
-		if report.Goal.Status == "complete" || report.Goal.Status == "blocked" {
+		if report.Goal.Status == "complete" || report.Goal.Status == "blocked" || report.Goal.Status == "cancelled" || report.Goal.Status == "canceled" {
 			return false
 		}
 	}
@@ -5971,8 +5979,9 @@ func responsesGoalContinuationOpen(input any) bool {
 // responsesMessagePhase names the phase of an assistant message item. A turn
 // that ends in a tool call is commentary, and so is a turn inside a goal the
 // client has not closed.
-func responsesMessagePhase(goalOpen bool, toolCalls []client.ToolCall) string {
-	if len(toolCalls) > 0 || goalOpen {
+func responsesMessagePhase(goalOpen bool, toolCalls []client.ToolCall, content ...string) string {
+	blocked := len(content) > 0 && toolcalling.TaskBlocked(content[0])
+	if len(toolCalls) > 0 || (goalOpen && !blocked) {
 		return "commentary"
 	}
 	return "final_answer"
@@ -6112,7 +6121,7 @@ func buildResponsesObject(responseID string, createdAt int64, model, text, think
 	// Add message item with output_text (only if there is text content)
 	if text != "" || len(toolCalls) == 0 {
 		msgID := fmt.Sprintf("msg_%s", responseID)
-		phase := responsesMessagePhase(goalOpen, toolCalls)
+		phase := responsesMessagePhase(goalOpen, toolCalls, text)
 		output = append(output, map[string]any{
 			"id":     msgID,
 			"type":   "message",
@@ -6348,7 +6357,9 @@ func (api *APIServer) nonStreamResponses(
 			if api.responsesRequestCanceled(ctx, sid) {
 				return
 			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
+			if isProgressFailure(parseErr) {
+				api.sendUpstreamError(w, "tool execution", parseErr)
+			} else if errors.Is(parseErr, errSimulatedToolCallRequired) {
 				writeResponsesSimulationError(
 					w,
 					false,
@@ -6862,7 +6873,10 @@ func (api *APIServer) streamResponses(
 			if api.responsesRequestCanceled(ctx, sid) {
 				return
 			}
-			if errors.Is(parseErr, errSimulatedToolCallRequired) {
+			if isProgressFailure(parseErr) {
+				_, code := classifyUpstreamError(parseErr)
+				sendFailed(code, upstreamErrorMessage("tool execution", code))
+			} else if errors.Is(parseErr, errSimulatedToolCallRequired) {
 				sendFailed(
 					simulatedToolCallRequiredCode,
 					parseErr.Error(),
@@ -6912,7 +6926,7 @@ func (api *APIServer) streamResponses(
 		}
 
 		if messageItemEmitted {
-			phase := responsesMessagePhase(goalOpen, toolCalls)
+			phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
 			sendEvent("response.output_text.done", map[string]any{
 				"item_id":       msgID,
 				"output_index":  messageOutputIndex,
@@ -6955,7 +6969,7 @@ func (api *APIServer) streamResponses(
 					finishReason = "length"
 				}
 			}
-			phase := responsesMessagePhase(goalOpen, toolCalls)
+			phase := responsesMessagePhase(goalOpen, toolCalls, fullText)
 
 			sendEvent("response.output_item.added", map[string]any{
 				"output_index": outputIdx,
@@ -7073,7 +7087,7 @@ func (api *APIServer) streamResponses(
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
-					"phase":  responsesMessagePhase(goalOpen, toolCalls),
+					"phase":  responsesMessagePhase(goalOpen, toolCalls, fullText),
 					"content": []map[string]any{
 						{
 							"type":        "output_text",

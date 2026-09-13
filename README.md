@@ -724,6 +724,8 @@ A failed backend request is classified rather than reported as a generic `500`:
 | `429`  | `rate_limit_exceeded`      | M365 throttled the request; a `Retry-After` header is sent   |
 | `429`  | `upstream_throttled`       | The conversation message quota is exhausted                  |
 | `409`  | `tool_round_limit`         | One turn drove more tool rounds than `M365_MAX_TOOL_ROUNDS`  |
+| `409`  | `tool_loop_stalled`        | Sustained identical operations/results made no progress; the task is incomplete |
+| `409`  | `task_incomplete`          | Bounded continuation attempts left an acknowledged plan unfinished |
 | `404`  | `model_not_found`          | The requested model is not in `GET /v1/models`               |
 | `502`  | `upstream_error`           | M365 rejected the request or was unreachable                 |
 | `502`  | `upstream_unavailable`     | The WebSocket handshake failed or the connection dropped     |
@@ -1025,7 +1027,7 @@ Agent clients such as Claude Code and Codex drive the tool loop themselves and r
 
 - Exceeding the cap returns `409 tool_round_limit` and reports the round count. HTTP 409 is not a status the Anthropic SDK expects, but an explicit refusal is better than answering forever while the client asks for one more round.
 - Completed calls and their results are restated in the prompt as final evidence, so the model answers from a result it already has instead of asking for it again. When the same call has failed the same way more than once, the prompt also asks for a change of approach.
-- A tool call repeating a name and arguments whose result is already in the turn is dropped on the third identical attempt. The first repeat passes, because reading a file back after writing it, or re-running the tests after a change, are ordinary. A call demanded through `tool_choice` is always forwarded, and a drop never triggers the corrective re-ask, because re-asking would produce the same call again.
+- Repeated reads and tests are permitted. A no-progress guard applies only after six consecutive identical operations return identical full results, with no intervening operation. Changed output, another operation, a pending operation, or a new user turn resets that streak. Process/agent polling remains governed by the overall round and time limits. An exhausted no-progress guard returns `tool_loop_stalled` rather than fabricating an assistant completion. A call demanded through `tool_choice` retains its existing semantics.
 - Each restated result is compacted to a head and a tail around a marker naming the removed size, so a long build log does not grow the prompt on every round.
 - A tool call id declared twice, or answered twice, is rejected with HTTP 400: nothing can tell which call a later result belongs to.
 - A reply that only announces which tool it means to use, naming a declared tool in a short sentence without a code fence, is re-asked once. If the retry stays an announcement, the answer text is replaced so the client is not left waiting for a call that never comes.
@@ -1033,6 +1035,48 @@ Agent clients such as Claude Code and Codex drive the tool loop themselves and r
 - A grammar-constrained tool (`"type": "custom"`, such as Codex code mode's `exec`) takes a raw body rather than JSON arguments. When the backend emits that body unfenced, either as a lone `{"input": "..."}` object or as bare source, it is claimed as a `custom_tool_call` on `/v1/responses` instead of being forwarded as escaped text.
 - A client-declared `web_search` tool is never routed back to the client. M365 runs the search itself through `BingWebSearch` and writes the results into the answer. The declaration stays in the prompt so the model knows the capability exists. When `web_search` is the only declared tool, the request drops out of the simulated tool path entirely and streams as ordinary text.
 - When the request declares tools, the turn emits no tool call, and no tool result exists, an answer claiming in the first person to have carried the work out is replaced with a short statement that nothing was verified. The original text is logged at debug level. A third-person statement such as "Go was created at Google", and a long prose answer, are never touched. The replacement also applies to the streaming Chat Completions, Messages and Completions endpoints, which buffer a tool-enabled turn until the parse is done. Only `/v1/responses` streaming publishes content as it decodes it, so there the case is logged instead.
+
+### Task continuity across clients
+
+The tool-capable Chat Completions, Completions, Anthropic Messages and Responses
+paths share the continuity policy. Follow-up requirements, greetings and status
+questions retain unfinished work. Delegation is an intermediate step; the parent
+must inspect the returned result and complete the remaining work and verification.
+
+When the supplied history contains an acknowledged `todowrite`, `todo_write` or
+`update_plan`, the bridge reconstructs its unfinished queue across user turns.
+Partial plan updates append work and retain older unfinished items; omission is
+not completion. Stable item labels identify updates. Explicit completed/cancelled
+statuses remove items, and a full update can reprioritize the queue. There is no
+special two-request limit. Explicit cancellation also prevents the old queue from
+reappearing on a later message.
+Failed/unanswered planning calls and unrelated tool outputs cannot change that
+state. A premature final answer with pending items triggers bounded recovery and,
+if recovery fails, a `task_incomplete` error. Explicit cancellation, truthful plan
+completion, `tool_choice=none`, and a final answer beginning with `Blocked:` are
+honored. Responses goal markers similarly survive an ordinary follow-up and close
+on a completed/blocked/cancelled goal or an explicit standalone cancellation.
+
+The bridge uses the history the client supplies; it cannot recover a plan the
+client has removed during compaction. Clients without planning tools still receive
+the shared execution/verification instructions and progress-aware loop protection.
+Plan status is evidence reported by the client, not independent proof that code
+or tests are correct.
+
+`scripts/verify-continuity.py` provides opt-in live checks using disposable fixtures.
+The native OpenCode and Codex tests send second, third and fourth bug-fix requests
+plus a status question while the initial failing check is running, require all
+four fixes, and independently verify the result
+without allowing the agent to alter the acceptance checks. The API mode checks
+fresh reads after edits on all three protocols, streaming and non-streaming.
+
+```powershell
+python scripts/verify-continuity.py --mode api --base-url http://localhost:8000/v1 --work-dir <new-test-directory>
+```
+
+The harness reads `M365BRIDGE_API_KEY` from the process or Windows user environment.
+It does not rewrite a client's installed configuration. Native test overrides are
+limited to the test process/thread and its disposable workspace.
 
 ## Built-in coding tools (opt-in)
 

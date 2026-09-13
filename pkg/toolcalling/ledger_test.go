@@ -148,8 +148,8 @@ func TestFilterRepeatedDropsOnlyThePersistentRepeat(t *testing.T) {
 		2,
 	)
 	kept, dropped = answeredTwice.FilterRepeated([]ToolCall{call("read_file", `{"path":"main.go"}`)})
-	if len(kept) != 0 || len(dropped) != 1 {
-		t.Fatalf("the third identical call survived: kept=%d dropped=%d", len(kept), len(dropped))
+	if len(kept) != 1 || len(dropped) != 0 {
+		t.Fatalf("an ordinary third inspection was blocked: kept=%d dropped=%d", len(kept), len(dropped))
 	}
 
 	kept, dropped = answeredTwice.FilterRepeated([]ToolCall{call("read_file", `{"path":"other.go"}`)})

@@ -1,7 +1,9 @@
 package toolcalling
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,6 +25,14 @@ const maxEvidenceResult = 4000
 // minEvidenceTail is the smallest tail kept when a result is compacted. The end
 // of a command's output usually holds the verdict.
 const minEvidenceTail = 80
+
+// A few identical observations are normal during debugging. Only a sustained,
+// consecutive run of identical operations AND complete results is stalled.
+const MaxUnchangedToolResults = 6
+
+var ErrToolLoopStalled = errors.New("tool_loop_stalled")
+
+const ToolLoopStalledMessage = "The task is incomplete: repeated tool calls returned unchanged results without an intervening operation. Change the approach or resume with a new instruction; the bridge did not mark the work completed."
 
 // failureSignal matches the wording a tool result uses to report that the tool
 // did not do what it was asked. The ledger uses it to tell an answered call
@@ -49,6 +59,10 @@ type ToolEvidence struct {
 // is rebuilt from the incoming message history on every request, because the
 // server holds no state between the turns of such a loop.
 type Ledger struct {
+	Tasks            TaskState
+	lastSignature    string
+	lastResult       [sha256.Size]byte
+	unchangedResults int
 	// Completed holds the calls whose results are already in the history.
 	Completed []ToolEvidence
 	// Pending holds the calls the client announced but has not answered.
@@ -79,6 +93,7 @@ type LedgerCall struct {
 type LedgerResult struct {
 	ID      string
 	Content string
+	IsError bool
 }
 
 // CanonicalArguments normalizes a tool argument string so that two calls that
@@ -152,10 +167,10 @@ func CallSignature(name, arguments string) string {
 // The caller collects calls and results from its own message shape, which keeps
 // this package independent of the provider payload types.
 func BuildLedger(calls []LedgerCall, results []LedgerResult, rounds int) Ledger {
-	resultByID := make(map[string]string, len(results))
+	resultByID := make(map[string]LedgerResult, len(results))
 	for _, result := range results {
 		if result.ID != "" {
-			resultByID[result.ID] = result.Content
+			resultByID[result.ID] = result
 		}
 	}
 
@@ -165,19 +180,29 @@ func BuildLedger(calls []LedgerCall, results []LedgerResult, rounds int) Ledger 
 
 	for _, call := range calls {
 		evidence := ToolEvidence{ID: call.ID, Name: call.Name, Arguments: call.Arguments}
-		result, answered := resultByID[call.ID]
+		record, answered := resultByID[call.ID]
 		if !answered {
 			ledger.Pending = append(ledger.Pending, evidence)
+			ledger.unchangedResults = 0
+			ledger.lastSignature = ""
 			continue
 		}
+		result := record.Content
 		// The failure verdict and the repetition signature read the untrimmed
 		// result: the failing line can sit in the middle of a long log, which
 		// is exactly the part compactResult drops.
-		evidence.Failed = failureSignal.MatchString(result)
+		evidence.Failed = record.IsError || failureSignal.MatchString(result)
 		evidence.Result = compactResult(result)
 		ledger.Completed = append(ledger.Completed, evidence)
 
 		signature := CallSignature(call.Name, call.Arguments)
+		digest := sha256.Sum256([]byte(strings.TrimSpace(result)))
+		if signature == ledger.lastSignature && digest == ledger.lastResult {
+			ledger.unchangedResults++
+		} else {
+			ledger.unchangedResults = 1
+		}
+		ledger.lastSignature, ledger.lastResult = signature, digest
 		if seenCall[signature] {
 			ledger.RepeatedCall = true
 			if ledger.RepetitionSignature == "" {
@@ -197,6 +222,7 @@ func BuildLedger(calls []LedgerCall, results []LedgerResult, rounds int) Ledger 
 		seenFailure[failureKey] = true
 	}
 
+	ledger.Tasks = TasksFromHistory(calls, results)
 	return ledger
 }
 
@@ -213,25 +239,30 @@ func (l Ledger) CompletedCount(name, arguments string) int {
 	return count
 }
 
-// FilterRepeated splits parsed tool calls into the ones worth forwarding and
-// the ones the model is issuing for at least the third time.
-//
-// The first repeat is allowed through: reading a file back after writing it, or
-// re-running the tests after a change, are ordinary and the arguments are
-// identical both times. A third identical call means the model is not reacting
-// to the result it already has.
+// FilterRepeated rejects sustained no-progress runs, not ordinary revisits.
+// Any intervening operation, changed result, pending operation, or new user
+// turn resets the evidence. Polling is bounded by the overall round/time limits.
 func (l Ledger) FilterRepeated(calls []ToolCall) (kept, dropped []ToolCall) {
 	if len(l.Completed) == 0 {
 		return calls, nil
 	}
 	for _, call := range calls {
-		if l.CompletedCount(call.Name, string(call.Arguments)) >= 2 {
+		if !isPollingTool(call.Name) && l.unchangedResults >= MaxUnchangedToolResults &&
+			CallSignature(call.Name, string(call.Arguments)) == l.lastSignature {
 			dropped = append(dropped, call)
 			continue
 		}
 		kept = append(kept, call)
 	}
 	return kept, dropped
+}
+
+func isPollingTool(name string) bool {
+	switch shortToolName(name) {
+	case "write_stdin", "wait", "wait_agent", "wait_for_agent", "wait_for_completion":
+		return true
+	}
+	return false
 }
 
 // RepeatedCallsNotice replaces the answer text when every tool call of a turn
@@ -245,7 +276,7 @@ const RepeatedCallsNotice = "The tools requested in this turn have already run w
 // asking for it again. It returns an empty string when there is no evidence.
 func (l Ledger) EvidenceNote() string {
 	if len(l.Completed) == 0 {
-		return ""
+		return l.Tasks.Note()
 	}
 
 	encoded, err := json.Marshal(l.Completed)
@@ -255,13 +286,16 @@ func (l Ledger) EvidenceNote() string {
 
 	var note strings.Builder
 	note.WriteString("TOOL EVIDENCE FROM THIS CONVERSATION\n")
-	note.WriteString("These tool calls already ran and their results are final:\n")
+	note.WriteString("These tool calls ran at the time recorded; their results are historical observations, not proof that all requested work is complete:\n")
 	note.Write(encoded)
-	note.WriteString("\nTreat each result as authoritative. Do not call a tool again with the same name and the same arguments unless the result was a failure you are addressing differently.")
+	note.WriteString("\nUse these results as evidence. Re-read files and re-run checks when edits, new instructions, changed state, or verification require it, even with identical arguments. Do not repeat unchanged operations indefinitely without making progress.")
 	if l.RepeatedFailure {
 		note.WriteString("\nThe call named ")
 		note.WriteString(l.RepetitionSignature)
 		note.WriteString(" already failed the same way more than once. Change the approach or report the failure to the user instead of repeating it.")
+	}
+	if l.Tasks.Unfinished() {
+		note.WriteString("\n\n" + l.Tasks.Note())
 	}
 	return note.String()
 }

@@ -84,18 +84,17 @@ func TestGoalContinuationIgnoresAnUnrelatedOutput(t *testing.T) {
 	}
 }
 
-// A later user item without the marker is a new request, so the earlier goal no
-// longer governs this turn.
-func TestGoalContinuationEndsAtANewUserRequest(t *testing.T) {
+// Explicit cancellation closes an earlier goal; an ordinary follow-up does not.
+func TestGoalContinuationEndsAtExplicitCancellation(t *testing.T) {
 	input := []any{
 		goalUserItem(goalContextMarker + "ship the parser</codex_internal_context>"),
 		updateGoalCall("call_1"),
 		updateGoalOutput("call_1", "in_progress"),
-		goalUserItem("something else entirely"),
+		goalUserItem("cancel the previous task"),
 	}
 
 	if responsesGoalContinuationOpen(input) {
-		t.Fatal("a new user request stayed inside the earlier goal")
+		t.Fatal("explicit cancellation stayed inside the earlier goal")
 	}
 }
 

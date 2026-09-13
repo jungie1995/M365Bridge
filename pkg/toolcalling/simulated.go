@@ -54,6 +54,7 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice, evidenc
 			"Do not use code_interpreter or any built-in/baked-in tool. Only the client-supplied tools are valid.",
 			webSearchInstruction,
 			nativeToolBanInstruction,
+			TaskContinuityInstruction,
 		)
 		normalizedChoice := strings.TrimSpace(toolChoice)
 		switch strings.ToLower(normalizedChoice) {
@@ -107,6 +108,7 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 			"Do not use code_interpreter or another built-in tool unless its exact name is in the callable set.",
 			webSearchInstruction,
 			nativeToolBanInstruction,
+			TaskContinuityInstruction,
 		)
 
 		normalizedChoice := strings.TrimSpace(toolChoice)
@@ -159,6 +161,7 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 			"Do not use code_interpreter or any built-in/baked-in tool. Only the client-supplied tools are valid.",
 			webSearchInstruction,
 			nativeToolBanInstruction,
+			TaskContinuityInstruction,
 		)
 		switch strings.ToLower(strings.TrimSpace(toolChoice)) {
 		case "any":

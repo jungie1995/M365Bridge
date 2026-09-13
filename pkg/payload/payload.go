@@ -116,6 +116,8 @@ type Message struct {
 	// It travels as a user message so the model reads it, but it neither
 	// answers the pending call nor starts a new user turn.
 	ToolProgress bool `json:"-"`
+	// Preserve an explicit cancellation when the API wraps content for simulation.
+	TaskCancelled bool `json:"-"`
 }
 
 // ToolCallRecord is one tool call announced by an assistant message, kept in
@@ -131,6 +133,7 @@ type ToolCallRecord struct {
 type ToolResultRecord struct {
 	ID      string
 	Content string
+	IsError bool
 }
 
 // ImageData represents an image extracted from multimodal content.
@@ -313,7 +316,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 					}
 				}
 			}
-			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: toolUseID, Content: resultContent})
+			isError, _ := block["is_error"].(bool)
+			m.ToolResults = append(m.ToolResults, ToolResultRecord{ID: toolUseID, Content: resultContent, IsError: isError})
 			m.Content += fmt.Sprintf("\n[Tool Result (call_id: %s)]\n%s\n", toolUseID, resultContent)
 		case "input_file", "file", "input_audio", "audio":
 			// The M365 backend accepts image attachments only, so these blocks

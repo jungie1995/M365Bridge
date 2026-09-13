@@ -2,6 +2,7 @@ package servers
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -38,7 +39,10 @@ func simWithRunTests() toolcalling.SimulatedResult {
 }
 
 func TestDropSettledToolCallsKeepsTheFirstRepeat(t *testing.T) {
-	got := dropSettledToolCalls(settledLedger(t, 1), "auto", simWithRunTests())
+	got, err := guardToolProgress(settledLedger(t, 2), "auto", simWithRunTests())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.ToolCalls) != 1 {
 		t.Fatalf("tool calls = %d, want the first repeat forwarded", len(got.ToolCalls))
 	}
@@ -48,25 +52,22 @@ func TestDropSettledToolCallsKeepsTheFirstRepeat(t *testing.T) {
 }
 
 func TestDropSettledToolCallsStopsThePersistentRepeat(t *testing.T) {
-	got := dropSettledToolCalls(settledLedger(t, 2), "auto", simWithRunTests())
-	if len(got.ToolCalls) != 0 {
-		t.Fatalf("tool calls = %d, want the third identical call dropped", len(got.ToolCalls))
+	got, err := guardToolProgress(settledLedger(t, toolcalling.MaxUnchangedToolResults), "auto", simWithRunTests())
+	if !errors.Is(err, toolcalling.ErrToolLoopStalled) {
+		t.Fatalf("error = %v, want an explicit no-progress failure", err)
 	}
-	if got.FinishReason != "stop" {
-		t.Fatalf("finish reason = %q, want stop once nothing is left to call", got.FinishReason)
-	}
-	if got.Content != toolcalling.RepeatedCallsNotice {
-		t.Fatalf("content = %q, want the substitute notice instead of an empty turn", got.Content)
-	}
-	if len(got.DroppedCalls) != 0 {
-		t.Fatalf("dropped calls = %#v, want no corrective re-ask triggered", got.DroppedCalls)
+	if got.FinishReason == "stop" || got.Content == toolcalling.RepeatedCallsNotice {
+		t.Fatal("a stalled loop was disguised as successful completion")
 	}
 }
 
 func TestDropSettledToolCallsKeepsExistingAnswerText(t *testing.T) {
 	sim := simWithRunTests()
 	sim.Content = "The build is already green."
-	got := dropSettledToolCalls(settledLedger(t, 2), "auto", sim)
+	got, err := guardToolProgress(settledLedger(t, 2), "auto", sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Content != "The build is already green." {
 		t.Fatalf("content = %q, want the model's own text preserved", got.Content)
 	}
@@ -76,7 +77,10 @@ func TestDropSettledToolCallsHonorsAForcedToolChoice(t *testing.T) {
 	// The caller demanded this call by name, so refusing it would contradict
 	// the request even though the result is already in hand.
 	for _, choice := range []string{"run_tests", "required", "any"} {
-		got := dropSettledToolCalls(settledLedger(t, 2), choice, simWithRunTests())
+		got, err := guardToolProgress(settledLedger(t, toolcalling.MaxUnchangedToolResults), choice, simWithRunTests())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(got.ToolCalls) != 1 {
 			t.Fatalf("tool_choice %q: tool calls = %d, want the demanded call forwarded", choice, len(got.ToolCalls))
 		}
@@ -86,7 +90,10 @@ func TestDropSettledToolCallsHonorsAForcedToolChoice(t *testing.T) {
 func TestDropSettledToolCallsLeavesADifferentCallAlone(t *testing.T) {
 	sim := simWithRunTests()
 	sim.ToolCalls[0].Arguments = json.RawMessage(`{"pkg":"./pkg/servers"}`)
-	got := dropSettledToolCalls(settledLedger(t, 2), "auto", sim)
+	got, err := guardToolProgress(settledLedger(t, toolcalling.MaxUnchangedToolResults), "auto", sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.ToolCalls) != 1 {
 		t.Fatalf("tool calls = %d, want a call with different arguments forwarded", len(got.ToolCalls))
 	}
@@ -101,7 +108,7 @@ func TestParseResponsesSimulationDropsASettledRepeat(t *testing.T) {
 
 	var sb strings.Builder
 	sb.WriteString(`[{"role":"user","content":"go"}`)
-	for i := range 2 {
+	for i := range toolcalling.MaxUnchangedToolResults {
 		id := "call_" + string(rune('0'+i))
 		sb.WriteString(`,{"role":"assistant","content":null,"tool_calls":[{"id":"` + id +
 			`","type":"function","function":{"name":"` + name + `","arguments":"{}"}}]}`)
@@ -114,17 +121,11 @@ func TestParseResponsesSimulationDropsASettledRepeat(t *testing.T) {
 		name + `","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n```"
 
 	result, err := parseResponsesSimulation(text, policy)
-	if err != nil {
-		t.Fatalf("parseResponsesSimulation: %v", err)
+	if !errors.Is(err, toolcalling.ErrToolLoopStalled) {
+		t.Fatalf("parseResponsesSimulation error = %v, want a stalled-loop error", err)
 	}
-	if len(result.toolCalls) != 0 {
-		t.Fatalf("tool calls = %d, want the settled repeat dropped on the Responses path", len(result.toolCalls))
-	}
-	if result.finishReason != "stop" {
-		t.Fatalf("finish reason = %q, want stop", result.finishReason)
-	}
-	if result.content != toolcalling.RepeatedCallsNotice {
-		t.Fatalf("content = %q, want the substitute notice", result.content)
+	if result.finishReason == "stop" {
+		t.Fatal("Responses reported a stalled loop as complete")
 	}
 }
 
