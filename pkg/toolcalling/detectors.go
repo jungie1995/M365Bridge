@@ -173,6 +173,22 @@ var toolIntentPhrase = regexp.MustCompile(
 // for, not a stray announcement.
 const toolIntentMaxRunes = 400
 
+var executionAnnouncement = regexp.MustCompile(`(?i)(^|[.!?]\s+)(i(?: will|'ll|’ll| am going to)\s+(?:now\s+)?|let me\s+)(implement|fix|patch|edit|update|modify|run|execute|inspect|read|verify|test|check|build|create|write|remove|delete|replace|adjust|correct|refactor|rewrite|install|debug|investigate|reproduce|retest|review|commit|push|deploy)\b`)
+
+// IsExecutionAnnouncement recognizes a short promise of tool work without a
+// delivered result. Conditional offers, quotations and substantive explanations
+// remain ordinary answers. Callers apply this only on a tool-enabled turn.
+func IsExecutionAnnouncement(text string) bool {
+	text = strings.TrimSpace(text)
+	if len([]rune(text)) > toolIntentMaxRunes || strings.ContainsAny(text, "\n\r\"") || strings.Contains(text, "```") {
+		return false
+	}
+	if matchesAny(text, []string{"if you", "when you", "once you", "after you", "would you", "could you"}) {
+		return false
+	}
+	return executionAnnouncement.MatchString(text)
+}
+
 // IsToolIntentNarration reports whether the reply only announces which tool it
 // intends to use.
 //

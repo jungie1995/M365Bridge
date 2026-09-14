@@ -1143,6 +1143,60 @@ message retention, set `M365_STORE_CONTINUITY=false` and `M365_ENABLE_WEB_UI=fal
 Recovery depends on retained state or client-supplied context; these bounds do not
 provide unlimited memory or independent proof that the client's work is correct.
 
+### Failure recovery and idempotency
+
+The shared model transport retries transient timeouts, connection failures, empty
+turns, and selected upstream `408`/`429`/`5xx` responses. Streaming retries stop as
+soon as text, reasoning, or tool data has been forwarded to the API handler. A
+partial reply ends with `upstream_stream_interrupted`; it cannot become a successful
+completion or be silently replaced with a regenerated reply. A cancelled HTTP
+request cancels its upstream work. A short execution-only announcement such as
+“I’ll implement…” receives bounded correction and then `task_incomplete` if it
+still supplies no execution, including when no planning tool was acknowledged.
+
+`M365_UPSTREAM_MAX_ATTEMPTS` defaults to **3**, is capped at **5**, and accepts `1`
+to disable automatic retry. Backoff starts at 500 ms with jitter; a supplied
+`Retry-After` is honored, never shortened to fit the budget. The supported inference
+routes share **4 extra attempts** per HTTP request and a **20-second retry window**
+starting at the first retry. An individual attempt has a five-minute deadline;
+streaming also has a three-minute idle timeout. A generation already started by a
+permitted retry can outlive the retry window. Authentication/permission failures,
+invalid requests and unknown errors are not blindly retried.
+
+For `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, and
+`/v1/responses/compact`, callers can opt into durable deduplication by supplying
+**`Idempotency-Key`** (1–128 visible ASCII characters). The key is scoped to the
+validated credential and endpoint, and bound to the canonical JSON body and
+session. Reusing it with different input or a different session returns
+`409 idempotency_conflict`.
+
+- A completed request replays the exact HTTP/SSE body, preserving response IDs,
+  tool-call IDs and event sequence numbers, without executing the handler again.
+- Concurrent duplicates share an OS-locked request lane. A busy lane returns
+  `409 idempotency_in_progress` with `Retry-After: 1`; retry the same key.
+- A process crash, cancellation or unretained outcome leaves an indeterminate
+  marker. `409 idempotency_indeterminate` requires reconciling acknowledged tool
+  results and resuming with a **new** key; unknown work is never rerun automatically.
+- Terminal error responses are replayed too. Use a new key for a new attempt after
+  handling that error. A key is not an instruction to rerun a failed operation.
+- Receipts use the encrypted continuity store, expire after 24 hours, and remain
+  protected from capacity eviction until expiry. The shared 64 MiB / 256-record
+  budget still applies. Replay bodies are limited to **2 MiB**; overflow is explicit
+  and retains a marker preventing duplicate execution.
+- `store:false` and disabled continuity storage reject this opt-in before executing
+  the request. Ordinary requests without the header keep their existing behavior.
+  Response deletion removes its Responses-history record; replay receipts have
+  their separate key-based retention window.
+
+`X-Request-ID` identifies a logical request in retry logs; replay returns the
+original ID and `Idempotency-Replayed: true`. Diagnostics log retry counts, codes
+and delays rather than request bodies or idempotency keys. Native clients need to
+send `Idempotency-Key` to use durable replay; the bridge does not invent keys from
+conversation IDs or silently treat identical user requests as duplicates.
+
+The repeatable fault/stress tests and the current live-validation status are
+documented in [failure-recovery validation](docs/failure-recovery-validation.md).
+
 ## Built-in coding tools (opt-in)
 
 M365Bridge can run a restricted set of local coding operations on the server. This is **off by default**; `M365_ENABLE_CODE_TOOLS=1` is its main gate. It is available on `/v1/chat/completions`, `/v1/messages` and `/v1/responses`.

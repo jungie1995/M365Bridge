@@ -19,7 +19,7 @@ If truly blocked and user input is needed, use the client's question tool or beg
 
 var ErrTaskIncomplete = errors.New("task_incomplete")
 
-const TaskIncompleteMessage = "The task is incomplete: the model ended its reply while acknowledged plan items were still open. Resume the unfinished work or report a specific blocker; no completion was recorded by the bridge."
+const TaskIncompleteMessage = "The task is incomplete: the model ended its reply with an unfinished plan or only announced future execution. Resume the unfinished work or report a specific blocker; no completion was recorded by the bridge."
 
 type TaskState struct {
 	Pending []string `json:"pending,omitempty"`

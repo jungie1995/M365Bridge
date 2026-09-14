@@ -189,9 +189,10 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 	if resp.StatusCode != http.StatusOK {
 		logging.Errorf("UploadFile: upload failed status=%d body=%s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
 		return nil, &UpstreamError{
-			Op:     "upload",
-			Status: resp.StatusCode,
-			Err:    errors.New(string(respBody)),
+			Op:         "upload",
+			Status:     resp.StatusCode,
+			Err:        errors.New(string(respBody)),
+			RetryAfter: ResponseRetryAfter(resp),
 		}
 	}
 
@@ -218,6 +219,13 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 // dialConnection opens a new WebSocket connection for a single request.
 // The caller is responsible for closing the connection when done.
 func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, error) {
+	return c.dialConnectionContext(context.Background(), conversationID, userOID, tenantID)
+}
+
+func (c *M365Client) dialConnectionContext(ctx context.Context, conversationID, userOID, tenantID string) (*websocket.Conn, string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", "", err
+	}
 	logging.Debugf("dialConnection: convID=%s", conversationID)
 	token, err := c.tokenManager.Get()
 	if err != nil {
@@ -240,7 +248,7 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 	// The dial response carries the status the backend refused with. Discarding
 	// it would leave an expired token, a throttled account and a backend outage
 	// indistinguishable at the HTTP layer.
-	conn, dialResp, err := dialer.Dial(url, nil)
+	conn, dialResp, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
 		status := 0
 		if dialResp != nil {
@@ -248,8 +256,10 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 			_ = dialResp.Body.Close()
 		}
 		logging.Errorf("dialConnection: WebSocket dial failed: status=%d err=%v", status, err)
-		return nil, "", "", &UpstreamError{Op: "dial", Status: status, Err: err}
+		return nil, "", "", &UpstreamError{Op: "dial", Status: status, Err: err, RetryAfter: ResponseRetryAfter(dialResp)}
 	}
+	stopWatch := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopWatch()
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(handshakeMessage)); err != nil {
 		_ = conn.Close()
@@ -538,7 +548,7 @@ func (c *M365Client) runConversationStream(
 	tone, gptOverride, conversationID, userOID, tenantID string,
 	hasTools bool,
 ) {
-	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
+	conn, hexSID, uuidSID, err := c.dialConnectionContext(ctx, conversationID, userOID, tenantID)
 	if err != nil {
 		logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
 		if ctx.Err() == nil {

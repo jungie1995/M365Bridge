@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
@@ -95,11 +96,10 @@ func (api *APIServer) sendRequestBodyError(w http.ResponseWriter, err error) {
 // loop and the payload builders fail through this same path, and reporting our
 // own bug as a backend outage would send the client into a pointless retry.
 func classifyUpstreamError(err error) (int, string) {
+	if status, code, ok := classifyRecoveryError(err); ok {
+		return status, code
+	}
 	switch {
-	case errors.Is(err, toolcalling.ErrToolLoopStalled):
-		return http.StatusConflict, "tool_loop_stalled"
-	case errors.Is(err, toolcalling.ErrTaskIncomplete):
-		return http.StatusConflict, "task_incomplete"
 	case errors.Is(err, auth.ErrTokenNotFound), errors.Is(err, auth.ErrRefreshFailed):
 		return http.StatusUnauthorized, upstreamAuthFailedCode
 	case errors.Is(err, context.DeadlineExceeded):
@@ -157,11 +157,10 @@ func classifyUpstreamStatus(status int) (int, string) {
 
 // upstreamErrorMessage states what failed without quoting the transport error.
 func upstreamErrorMessage(op, code string) string {
+	if message, ok := recoveryErrorMessages[code]; ok {
+		return message
+	}
 	switch code {
-	case "tool_loop_stalled":
-		return toolcalling.ToolLoopStalledMessage
-	case "task_incomplete":
-		return toolcalling.TaskIncompleteMessage
 	case upstreamAuthFailedCode:
 		return "M365 authentication failed; the stored credentials could not be used for this " + op + " request"
 	case upstreamForbiddenCode:
@@ -175,7 +174,7 @@ func upstreamErrorMessage(op, code string) string {
 	case upstreamRejectedCode:
 		return "M365 rejected the " + op + " request"
 	case upstreamTurnFailedCode:
-		return "M365 accepted the " + op + " request but ended the turn without producing an answer; a model whose backend tone is no longer served fails this way on every request"
+		return "M365 ended the " + op + " request without producing an answer. Resume from acknowledged context; check model availability if this persists."
 	default:
 		return "the " + op + " request failed before it could be completed"
 	}
@@ -231,7 +230,33 @@ func (api *APIServer) sendUpstreamError(w http.ResponseWriter, op string, err er
 	}
 
 	if status == http.StatusTooManyRequests {
-		w.Header().Set("Retry-After", strconv.Itoa(rateLimitRetryAfterSeconds))
+		delay := rateLimitRetryAfterSeconds
+		if duration, ok := client.UpstreamRetryAfter(err); ok {
+			delay = int((duration + time.Second - 1) / time.Second)
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(delay))
 	}
 	api.sendErrorCode(w, status, code, upstreamErrorMessage(op, code))
+}
+
+var recoveryErrorMessages = map[string]string{
+	interruptedStreamCode: "The upstream connection failed after output began. This reply is incomplete; resume from the client's acknowledged tool results. Automatic replay was stopped to avoid inconsistent output.",
+	"request_cancelled":   "The request was cancelled; no successful completion was recorded.",
+	"tool_loop_stalled":   toolcalling.ToolLoopStalledMessage,
+	"task_incomplete":     toolcalling.TaskIncompleteMessage,
+}
+
+func classifyRecoveryError(err error) (int, string, bool) {
+	if _, ok := errors.AsType[*interruptedStreamError](err); ok {
+		return http.StatusBadGateway, interruptedStreamCode, true
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return http.StatusRequestTimeout, "request_cancelled", true
+	case errors.Is(err, toolcalling.ErrToolLoopStalled):
+		return http.StatusConflict, "tool_loop_stalled", true
+	case errors.Is(err, toolcalling.ErrTaskIncomplete):
+		return http.StatusConflict, "task_incomplete", true
+	}
+	return 0, "", false
 }

@@ -206,31 +206,39 @@ func (b *cancelledContractBackend) ChatConversationStreamGenContext(ctx context.
 }
 
 func TestClientDisconnectCancelsUpstreamBufferedAndStreamingRequests(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		api, server := newContractServer(t)
-		backend := &cancelledContractBackend{modelBackend: api.m365Client, started: make(chan struct{}), stopped: make(chan struct{})}
-		api.m365Client = backend
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		body, _ := json.Marshal(map[string]any{"model": "gpt-5.6-reasoning", "input": "SDK_WAIT", "stream": stream})
-		r, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(string(body)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.Header.Set("Authorization", "Bearer sdk-fixture-key")
-		finished := make(chan struct{})
-		go func() {
-			defer close(finished)
-			response, err := http.DefaultClient.Do(r)
-			if err == nil {
-				_, _ = io.Copy(io.Discard, response.Body)
-				_ = response.Body.Close()
+	for _, protocol := range []string{"chat", "responses", "anthropic"} {
+		for _, stream := range []bool{false, true} {
+			api, server := newContractServer(t)
+			backend := &cancelledContractBackend{modelBackend: api.m365Client, started: make(chan struct{}), stopped: make(chan struct{})}
+			api.m365Client = newRecoveringBackend(backend, defaultRecoveryPolicy())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			path, request := protocolRequest(protocol, "SDK_WAIT", stream)
+			body, _ := json.Marshal(request)
+			r, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+path, strings.NewReader(string(body)))
+			if err != nil {
+				t.Fatal(err)
 			}
-		}()
-		awaitContractSignal(t, backend.started)
-		cancel()
-		awaitContractSignal(t, backend.stopped)
-		awaitContractSignal(t, finished)
+			r.Header.Set("Authorization", "Bearer sdk-fixture-key")
+			r.Header.Set("Idempotency-Key", "cancelled-request")
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				response, err := http.DefaultClient.Do(r)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, response.Body)
+					_ = response.Body.Close()
+				}
+			}()
+			awaitContractSignal(t, backend.started)
+			cancel()
+			awaitContractSignal(t, backend.stopped)
+			awaitContractSignal(t, finished)
+			status, _, replay := postContract(t, server.URL, path, request, "cancelled-request", "sdk-fixture-key")
+			if status != 409 || !strings.Contains(string(replay), "idempotency_indeterminate") {
+				t.Fatal("cancelled request was replayed as success or reexecuted")
+			}
+		}
 	}
 }
 

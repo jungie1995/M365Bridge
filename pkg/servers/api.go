@@ -347,7 +347,7 @@ const tokenRefreshInterval = 30 * time.Minute
 func (api *APIServer) Start(port int) error {
 	api.mu.Lock()
 	// Initialize request transports and optional local coding tools.
-	api.m365Client = client.NewM365Client(api.tokenManager)
+	api.m365Client = newRecoveringBackend(client.NewM365Client(api.tokenManager), defaultRecoveryPolicy())
 	api.m365Client.SetThrottlingObserver(api.noteThrottling)
 	api.m365Client.SetWebSearchEnabled(api.config.EnableWebSearch)
 	if api.config.EnableCodeTools {
@@ -368,12 +368,12 @@ func (api *APIServer) Start(port int) error {
 	api.stopCh = make(chan struct{})
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.handleChatCompletions))
+	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.withInference(api.handleChatCompletions)))
 	mux.HandleFunc("/v1/completions", api.withAuth(api.handleCompletions))
-	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
-	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.handleResponsesCompact))
+	mux.HandleFunc("/v1/responses", api.withAuth(api.withInference(api.handleResponses)))
+	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.withInference(api.handleResponsesCompact)))
 	mux.HandleFunc("/v1/responses/", api.withAuth(api.handleStoredResponse))
-	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
+	mux.HandleFunc("/v1/messages", api.withAuth(api.withInference(api.handleAnthropicMessages)))
 	mux.HandleFunc("/v1/messages/count_tokens", api.withAuth(api.handleAnthropicCountTokens))
 	mux.HandleFunc("/v1/complete", api.withAuth(api.handleAnthropicComplete))
 	mux.HandleFunc("/v1/images/generations", api.withAuth(api.handleImageGenerations))
@@ -1213,7 +1213,8 @@ func (api *APIServer) sendConversationError(w http.ResponseWriter, err error) {
 func (api *APIServer) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Claude-Code-Session-Id, Session-Id")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Session-Id, X-Claude-Code-Session-Id, Session-Id, Idempotency-Key")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Idempotency-Replayed, Retry-After")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -2291,7 +2292,7 @@ func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.Stream
 	// Check max_tokens limit
 	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
 		s.truncated = true
-		drainStream(ch)
+		go drainStream(ch)
 		return streamLoopStop
 	}
 
@@ -2305,6 +2306,8 @@ func (s *completeStream) chunk(chunk client.StreamChunk, ch <-chan client.Stream
 
 // streamChatCompletions streams chat completion responses in OpenAI format.
 func (api *APIServer) streamChatCompletions(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel, includeUsage bool) {
+	upstreamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	flusher, ok := api.beginSSE(w)
 	if !ok {
 		return
@@ -2327,7 +2330,7 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 		model:   cfg.OpenAIID,
 	}
 
-	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	ch := api.m365Client.ChatConversationStreamGenContext(upstreamCtx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	// A stop sequence can straddle two chunks, so the deltas of a directly
 	// streamed answer pass through a writer that holds back the tail which
@@ -2350,6 +2353,10 @@ func (api *APIServer) streamChatCompletions(ctx context.Context, w http.Response
 			break
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
+	cancel()
 	if !hasTools {
 		// Whatever the writer held back belongs to the answer when no stop
 		// sequence ever arrived.
@@ -2496,7 +2503,7 @@ func (s *chatStream) chunk(chunk client.StreamChunk, ch <-chan client.StreamChun
 	// Check max_tokens limit before sending more content
 	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
 		s.truncated = true
-		drainStream(ch)
+		go drainStream(ch)
 		return streamLoopStop
 	}
 
@@ -2825,6 +2832,8 @@ func openAIAssistantMessage(respText, thinking string, toolCalls []client.ToolCa
 
 // streamAnthropicMessages streams messages in Anthropic SSE format.
 func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef, toolChoice string, stopSequences []string, noParallel bool) {
+	upstreamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	flusher, ok := api.beginSSE(w)
 	if !ok {
 		return
@@ -2849,23 +2858,14 @@ func (api *APIServer) streamAnthropicMessages(ctx context.Context, w http.Respon
 	// takes the trailing cut below instead.
 	stopWriter := newStopSequenceWriter(stopSequences)
 
-	ch := api.m365Client.ChatConversationStreamGenContext(ctx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
-
-	keepalive := time.NewTicker(sseKeepaliveInterval)
-	defer keepalive.Stop()
-	for {
-		chunk, more := nextStreamChunk(ctx, ch, keepalive, w, flusher, func() error { return writeAnthropicKeepalive(w, flusher) })
-		if !more {
-			break
-		}
-		step := stream.chunk(chunk, ch, maxTokens, hasTools, stopWriter, sid)
-		if step == streamLoopFailed {
-			return
-		}
-		if step == streamLoopStop {
-			break
-		}
+	ch := api.m365Client.ChatConversationStreamGenContext(upstreamCtx, messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	if !readAnthropicStream(ctx, stream, ch, maxTokens, hasTools, stopWriter, sid) {
+		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
+	cancel()
 	if !hasTools {
 		// Whatever the writer held back belongs to the answer when no stop
 		// sequence ever arrived.
@@ -3159,7 +3159,7 @@ func (s *anthropicStream) chunk(chunk client.StreamChunk, ch <-chan client.Strea
 	// Check max_tokens limit before sending more content
 	if maxTokens > 0 && countTokens(s.fullText.String()) >= maxTokens {
 		s.truncated = true
-		drainStream(ch)
+		go drainStream(ch)
 		return streamLoopStop
 	}
 
@@ -4260,9 +4260,9 @@ func writeAnthropicKeepalive(w http.ResponseWriter, flusher http.Flusher) error 
 
 // nextStreamChunk returns the next upstream chunk, writing a keepalive frame
 // through write for every interval that passes while the upstream is silent.
-// The second result is false once the channel closes, the request context is
-// canceled, or a keepalive write fails; the last two are how a stream to a gone
-// client ends while it sits idle.
+// The second result is false once the channel closes or the request is canceled.
+// A failed downstream write is an error chunk, so handlers take their failure
+// path instead of mistaking an interrupted response for ordinary completion.
 //
 // A chunk that carries a notice is written here as an SSE comment and never
 // returned, so every streaming responder reports one without a line of its own
@@ -4284,7 +4284,7 @@ func nextStreamChunk(ctx context.Context, ch <-chan client.StreamChunk, keepaliv
 				if chunk.Notice != "" {
 					if err := writeSSENotice(w, flusher, chunk.Notice); err != nil {
 						logging.Debugf("nextStreamChunk: notice write failed, ending stream: %v", err)
-						return client.StreamChunk{}, false
+						return client.StreamChunk{Error: err}, true
 					}
 					continue
 				}
@@ -4294,7 +4294,7 @@ func nextStreamChunk(ctx context.Context, ch <-chan client.StreamChunk, keepaliv
 			refreshStreamDeadline(w)
 			if err := write(); err != nil {
 				logging.Debugf("nextStreamChunk: keepalive write failed, ending stream: %v", err)
-				return client.StreamChunk{}, false
+				return client.StreamChunk{Error: err}, true
 			}
 		}
 	}

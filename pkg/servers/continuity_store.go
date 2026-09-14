@@ -250,11 +250,15 @@ func (s *continuityStore) retainedFiles(replacing string) (retentionFiles, error
 		}
 		retained.bytes += info.Size()
 		retained.count++
-		if !strings.HasPrefix(info.Name(), "checkpoint-") {
+		if !protectedStateRecord(info.Name()) {
 			retained.evictable = append(retained.evictable, info)
 		}
 	}
 	return retained, nil
+}
+
+func protectedStateRecord(name string) bool {
+	return strings.HasPrefix(name, "checkpoint-") || strings.HasPrefix(name, "replay-")
 }
 
 func (s *continuityStore) prune(replacing string, incoming int64) error {

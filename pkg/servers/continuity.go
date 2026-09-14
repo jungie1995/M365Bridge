@@ -31,6 +31,9 @@ func (p *localToolEvidence) ledger(rounds int) toolcalling.Ledger {
 }
 
 func continuationRepairNote(sim toolcalling.SimulatedResult, messages []payload.Message, tools []toolcalling.ToolDef, contracts toolcalling.ToolContracts, rawText string) (string, bool, bool) {
+	if toolcalling.IsExecutionAnnouncement(sim.Content) {
+		return toolcalling.BuildNativeToolBanNote() + " Continue the requested execution and verification, rather than returning a future-tense progress announcement.", false, true
+	}
 	tasks := buildToolLedger(messages).Tasks
 	if tasks.Unfinished() && !toolcalling.TaskBlocked(sim.Content) {
 		return toolcalling.TaskContinuityInstruction + "\n" + tasks.Note(), false, true
@@ -123,7 +126,7 @@ func guardToolProgress(ledger toolcalling.Ledger, toolChoice string, sim toolcal
 		return sim, nil
 	}
 	if len(sim.ToolCalls) == 0 {
-		if ledger.Tasks.Unfinished() && !toolcalling.TaskBlocked(sim.Content) {
+		if (ledger.Tasks.Unfinished() || toolcalling.IsExecutionAnnouncement(sim.Content)) && !toolcalling.TaskBlocked(sim.Content) {
 			return sim, toolcalling.ErrTaskIncomplete
 		}
 		return sim, nil

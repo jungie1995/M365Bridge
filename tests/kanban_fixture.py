@@ -100,6 +100,9 @@ class ServiceTests(unittest.TestCase):
         a = self.service.create_card(self.board["id"], "First")
         b = self.service.create_card(self.board["id"], "Second")
         self.service.move_card(self.board["id"], a["id"], "doing")
+        # The successful move may legitimately renumber the source column.
+        # Atomic rejection must preserve the state immediately before rejection.
+        b = self.service.get_card(self.board["id"], b["id"])
         audit_before = self.service.audit(self.board["id"])
         with self.assertRaises(RuntimeError): self.service.move_card(self.board["id"], b["id"], "doing")
         self.assertEqual(self.service.get_card(self.board["id"], b["id"]), b)

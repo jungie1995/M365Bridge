@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, 'integrate/**', 'feature/protocol-continuity']
+    branches: [main, master, 'integrate/**', 'feature/protocol-continuity', 'feature/failure-recovery']
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -84,6 +84,9 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+
+      - name: Validate network fault injector
+        run: python tests/fault_proxy_test.py
 
       # -race needs cgo, which is available on the ubuntu runner. Concurrency
       # regressions in the token refresh path only surface under the detector.

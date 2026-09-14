@@ -67,10 +67,11 @@ func TestNextStreamChunkStopsWhenTheKeepaliveWriteFails(t *testing.T) {
 	defer keepalive.Stop()
 
 	recorder := httptest.NewRecorder()
-	if _, more := nextStreamChunk(context.Background(), ch, keepalive, recorder, recorder, func() error {
+	chunk, more := nextStreamChunk(context.Background(), ch, keepalive, recorder, recorder, func() error {
 		return errors.New("connection reset by peer")
-	}); more {
-		t.Fatal("a failed keepalive write did not end the stream")
+	})
+	if !more || chunk.Error == nil {
+		t.Fatal("a failed keepalive write must take the responder's failure path")
 	}
 }
 
@@ -141,10 +142,11 @@ func TestNextStreamChunkStopsWhenTheNoticeWriteFails(t *testing.T) {
 	keepalive := time.NewTicker(time.Hour)
 	defer keepalive.Stop()
 
-	if _, more := nextStreamChunk(context.Background(), ch, keepalive, failingWriter{}, failingWriter{}, func() error {
+	chunk, more := nextStreamChunk(context.Background(), ch, keepalive, failingWriter{}, failingWriter{}, func() error {
 		return nil
-	}); more {
-		t.Fatal("a failed notice write did not end the stream")
+	})
+	if !more || chunk.Error == nil {
+		t.Fatal("a failed notice write must take the responder's failure path")
 	}
 }
 

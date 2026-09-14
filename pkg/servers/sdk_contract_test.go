@@ -39,14 +39,17 @@ func contractReply(messages []payload.Message, hasTools bool) (string, error) {
 	if strings.Contains(text, "SDK_FAILURE") {
 		return "", errors.New("private upstream detail access_token=must-not-escape")
 	}
-	if strings.Contains(text, "SDK_CHECK_TASKS") && !contractTasksPresent(text) {
-		return "CHECKPOINT_TASKS_MISSING", nil
-	}
 	if strings.Contains(text, "concise summary") {
 		return "The board work is in progress.", nil
 	}
+	if strings.Contains(text, "SDK_CHECK_TASKS") && !contractTasksPresent(text) {
+		return "CHECKPOINT_TASKS_MISSING", nil
+	}
 	if strings.Contains(text, "SDK_RESULT") {
 		return "CLIENT_RESULT_ACCEPTED", nil
+	}
+	if strings.Contains(text, "SDK_ANNOUNCE") {
+		return "The contract is confirmed. I’ll implement the function and run the checks.", nil
 	}
 	if hasTools && contractWantsTools(text) {
 		if strings.Contains(text, "Anthropic Messages API") {
@@ -107,13 +110,17 @@ func contractChunks(messages []payload.Message, tools bool) []client.StreamChunk
 
 func newContractServer(t *testing.T) (*APIServer, *httptest.Server) {
 	t.Helper()
-	root := t.TempDir()
+	return newContractServerAt(t, t.TempDir())
+}
+
+func newContractServerAt(t *testing.T, root string) (*APIServer, *httptest.Server) {
+	t.Helper()
 	api := &APIServer{config: &models.Config{APIKeys: []string{"sdk-fixture-key", "sdk-other-key"}}, m365Client: &contractBackend{}, ctxCache: NewContextCache(filepath.Join(root, "cache")), continuity: newContinuityStore(filepath.Join(root, "continuity")), imageRefs: newImageRefStore()}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.handleChatCompletions))
-	mux.HandleFunc("/v1/messages", api.withAuth(api.handleAnthropicMessages))
-	mux.HandleFunc("/v1/responses", api.withAuth(api.handleResponses))
-	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.handleResponsesCompact))
+	mux.HandleFunc("/v1/chat/completions", api.withAuth(api.withInference(api.handleChatCompletions)))
+	mux.HandleFunc("/v1/messages", api.withAuth(api.withInference(api.handleAnthropicMessages)))
+	mux.HandleFunc("/v1/responses", api.withAuth(api.withInference(api.handleResponses)))
+	mux.HandleFunc("/v1/responses/compact", api.withAuth(api.withInference(api.handleResponsesCompact)))
 	mux.HandleFunc("/v1/responses/", api.withAuth(api.handleStoredResponse))
 	mux.HandleFunc("/v1/models", api.withAuth(api.handleModels))
 	mux.HandleFunc("/v1/sessions", api.withAuth(api.handleSessions))

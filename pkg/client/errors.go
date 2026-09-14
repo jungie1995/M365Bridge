@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // UpstreamError carries the HTTP status the M365 backend answered with.
@@ -24,6 +27,29 @@ type UpstreamError struct {
 	Status int
 	// Err is the underlying transport or protocol error.
 	Err error
+	// RetryAfter preserves an explicit server delay, including zero.
+	RetryAfter *time.Duration
+}
+
+func ResponseRetryAfter(response *http.Response) *time.Duration {
+	if response == nil {
+		return nil
+	}
+	value := strings.TrimSpace(response.Header.Get("Retry-After"))
+	if seconds, err := strconv.ParseInt(value, 10, 32); err == nil && seconds >= 0 {
+		return new(time.Duration(seconds) * time.Second)
+	}
+	if deadline, err := http.ParseTime(value); err == nil {
+		return new(max(time.Until(deadline), 0))
+	}
+	return nil
+}
+
+func UpstreamRetryAfter(err error) (time.Duration, bool) {
+	if upstream, ok := errors.AsType[*UpstreamError](err); ok && upstream.RetryAfter != nil {
+		return *upstream.RetryAfter, true
+	}
+	return 0, false
 }
 
 // Error implements the error interface.
