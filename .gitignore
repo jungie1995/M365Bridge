@@ -1,11 +1,23 @@
+# Build artifacts
+bin/
+m365-bridge
+
+# Web interface sources. The build output is committed at pkg/webui/dist,
+# because go:embed reads it at compile time; web/dist is only the staging copy.
+web/node_modules/
+web/dist/
+
+# Data files (includes .env, tokens, cache, setup.json)
 data/
-text-runtime/
-image-runtime/
-*.exe
-*.log
-*.sqlite3
-*.json
-*.jsonl
-*.mp4
-*.png
-*.jpg
+test_logs/*
+__pycache__/
+.sdk-venv/
+
+# Docker
+docker-data/
+# Local compose overrides. Compose reads this automatically, so a committed one
+# would change every machine and the release path with it.
+docker-compose.override.yml
+webui_analysis.md
+encryption.key
+.gocache/

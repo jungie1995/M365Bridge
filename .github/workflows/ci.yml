@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, 'integrate/**', 'feature/protocol-continuity', 'feature/failure-recovery']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          go build -o "bin/m365-bridge-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/cli
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install official SDK contract dependencies
+        run: |
+          python -m venv .sdk-venv
+          .sdk-venv/bin/python -m pip install -r tests/sdk-requirements.txt
+
+      - name: Gofmt
+        run: |
+          unformatted="$(gofmt -l cmd pkg)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Validate network fault injector
+        run: python tests/fault_proxy_test.py
+
+      # -race needs cgo, which is available on the ubuntu runner. Concurrency
+      # regressions in the token refresh path only surface under the detector.
+      - name: Test
+        env:
+          CGO_ENABLED: 1
+          M365_SDK_PYTHON: ${{ github.workspace }}/.sdk-venv/bin/python
+        run: go test ./... -count=1 -race
+
+  modernize:
+    name: Modernize
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pin the toolchain so the modernize analyzer runs against a fixed Go
+      # version regardless of the setup-go patch release. `local` is the fixed
+      # version setup-go just installed from go-version-file, which is the
+      # go.mod floor. A literal here is a second declaration of that floor and
+      # drifts below it the moment go.mod is raised, which fails the job with
+      # "go.mod requires go >= X (running go Y)".
+      - name: Run gopls modernize analyzer
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Complexity gate
+        run: go run github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0 -over 10 -ignore 'vendor/|helper-projects/|\.gocache/|web/' .
+
+  installation:
+    name: Windows installation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fresh install and data-preserving upgrade
+        shell: pwsh
+        run: ./scripts/test-installation.ps1 -TestRoot (Join-Path $env:RUNNER_TEMP 'bridge-install-test')
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: m365bridge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
