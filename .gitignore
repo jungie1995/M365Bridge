@@ -1,0 +1,11 @@
+data/
+text-runtime/
+image-runtime/
+*.exe
+*.log
+*.sqlite3
+*.json
+*.jsonl
+*.mp4
+*.png
+*.jpg
