@@ -16,6 +16,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"maps"
 	"mime/multipart"
@@ -610,11 +614,16 @@ func (api *APIServer) handleBridgeReadiness(w http.ResponseWriter, r *http.Reque
 	}
 	account := api.config != nil && api.config.TenantID != "" && api.config.UserOID != ""
 	_, credentialErr := os.Stat("data/tokens/rt_90day.txt")
+	designerState := "browser_sign_in_required"
+	if api.tokenManager != nil {
+		designerState = api.tokenManager.DesignerCredentialState()
+	}
 	api.sendJSON(w, http.StatusOK, map[string]any{
 		"bridge": "M365Bridge", "setup_version": 2,
 		"account_configured": account, "credential_saved": credentialErr == nil,
-		"image_routing":     os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1",
-		"upstream_verified": false,
+		"image_routing":        os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1",
+		"upstream_verified":    false,
+		"designer_credentials": designerState,
 	})
 }
 
@@ -7989,6 +7998,9 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	}
 
 	messages := []payload.Message{{Role: "user", Content: fullPrompt}}
+	if !api.ensureImageAuthorization(w) {
+		return
+	}
 
 	// Image generation is a one-shot operation. Reusing a chat conversation can
 	// cause M365 to disengage instead of routing the prompt to image generation.
@@ -7999,7 +8011,11 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Extract image URLs from markdown in response text
-	dataItems := api.buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
+	dataItems, imageErr := api.buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
+	if imageErr != nil {
+		api.sendError(w, http.StatusBadGateway, imageErr.Error())
+		return
+	}
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No images were generated. The model may not have produced an image.")
 		return
@@ -8017,6 +8033,9 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	form, ok := api.parseImageEditForm(w, r)
 	if !ok {
+		return
+	}
+	if !api.ensureImageAuthorization(w) {
 		return
 	}
 
@@ -8059,7 +8078,11 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	api.storeSessionMapping(sid, finalConvID)
 
 	// Extract image URLs from response
-	dataItems := api.buildOpenAIImageData(respText, imageEditCount(r.FormValue("n")), form.prompt, r.FormValue("response_format"))
+	dataItems, imageErr := api.buildOpenAIImageData(respText, imageEditCount(r.FormValue("n")), form.prompt, r.FormValue("response_format"))
+	if imageErr != nil {
+		api.sendError(w, http.StatusBadGateway, imageErr.Error())
+		return
+	}
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
 		return
@@ -8069,6 +8092,17 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})
+}
+
+// Fail before spending an image turn when its download cannot be authorized.
+func (api *APIServer) ensureImageAuthorization(w http.ResponseWriter) bool {
+	if api.tokenManager != nil {
+		if token, err := api.tokenManager.GetDesignerToken(); err == nil && token != "" {
+			return true
+		}
+	}
+	api.sendError(w, http.StatusBadGateway, "image_auth_required: Designer image authorization is unavailable. Use Connect Microsoft account and finish the image authorization step, then retry. No image generation was started")
+	return false
 }
 
 // imageEditForm is what an image edit request declares once its form is parsed.
@@ -8238,12 +8272,15 @@ func buildImagePromptWithHints(prompt, size, quality, style string) string {
 // and converts them to OpenAI Images API data items. When responseFormat is
 // "b64_json", it downloads each URL and base64-encodes the content. When
 // responseFormat is "url", it also downloads the image and returns a
-// data:image/png;base64,... data URL (falling back to the raw URL on error)
-// since the raw designerapp URL is auth-gated and inaccessible to clients.
-func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
+// data URL. Auth-gated download links are never a substitute for image bytes.
+func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) ([]imageDataItem, error) {
+	return buildImageData(respText, n, revisedPrompt, responseFormat, api.downloadImage)
+}
+
+func buildImageData(respText string, n int, revisedPrompt, responseFormat string, download func(string) ([]byte, string, error)) ([]imageDataItem, error) {
 	urls := urlImagePattern.FindAllStringSubmatch(respText, -1)
 	if len(urls) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Deduplicate URLs
@@ -8263,24 +8300,19 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 
 	var items []imageDataItem
 	for _, u := range uniqueURLs {
-		b64, err := api.downloadAndBase64(u)
+		body, contentType, err := download(u)
 		if err != nil {
 			// A disallowed host is dropped outright. Returning the raw URL
 			// would hand a model-controlled address back to the client, which
 			// would then fetch it.
 			if errors.Is(err, errImageHostNotAllowed) {
-				logging.Errorf("Dropping generated image URL: %v", err)
+				logging.Error("Dropping generated image URL: untrusted download target")
 				continue
 			}
-			// The host is allowed but the transfer failed, so the raw URL is
-			// still a safe fallback.
-			logging.Errorf("Failed to download image: %v", err)
-			items = append(items, imageDataItem{
-				URL:           u,
-				RevisedPrompt: revisedPrompt,
-			})
-			continue
+			logging.Error("Generated image transfer failed; no image bytes returned")
+			return nil, errors.New("image_download_failed: Microsoft returned an image reference, but the bridge could not retrieve verified image bytes. Use Connect Microsoft account to renew Designer image access, then retry. No image was accepted")
 		}
+		b64 := base64.StdEncoding.EncodeToString(body)
 		if responseFormat == "b64_json" {
 			items = append(items, imageDataItem{
 				B64JSON:       b64,
@@ -8289,12 +8321,12 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 			continue
 		}
 		items = append(items, imageDataItem{
-			URL:           "data:image/png;base64," + b64,
+			URL:           "data:" + contentType + ";base64," + b64,
 			RevisedPrompt: revisedPrompt,
 		})
 	}
 
-	return items
+	return items, nil
 }
 
 // errImageHostNotAllowed reports a generated-image URL the proxy refuses to
@@ -8394,7 +8426,7 @@ func (api *APIServer) downloadImage(imageURL string) ([]byte, string, error) {
 		return nil, "", err
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	// validateImageDownloadURL ran inside designerImageRequest: it requires
 	// https, an allowlisted host, a name that resolves, and no resolved address
 	// outside public space. The taint analysis cannot follow that validator.
@@ -8415,7 +8447,7 @@ func (api *APIServer) designerImageRequest(imageURL string) (*http.Request, erro
 		logging.Errorf("downloadImage: refusing download: %v", err)
 		return nil, err
 	}
-	logging.Infof("downloadImage: downloading image from %s", imageURL[:min(100, len(imageURL))])
+	logging.Info("downloadImage: downloading from the validated Microsoft image service")
 	parsedURL, err := neturl.Parse(imageURL)
 	if err != nil {
 		logging.Errorf("downloadImage: invalid URL: %v", err)
@@ -8475,12 +8507,15 @@ func readDownloadedImage(resp *http.Response) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("generated image exceeds %d bytes", remoteImageMaxBytes)
 	}
 
-	// A designerapp response states its own type. An answer without one is
-	// treated as PNG, which is what this backend has been observed to return.
-	contentType := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "image/") {
-		contentType = "image/png"
+	// Never relabel an HTML login/error page as PNG, even with HTTP 200.
+	config, format, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil || config.Width < 1 || config.Height < 1 || int64(config.Width)*int64(config.Height) > 40_000_000 {
+		return nil, "", errors.New("Microsoft image response was not a supported raster within safe dimensions")
 	}
+	if _, _, err := image.Decode(bytes.NewReader(body)); err != nil {
+		return nil, "", errors.New("Microsoft image response was incomplete or corrupt")
+	}
+	contentType := "image/" + format
 
 	logging.Infof("downloadImage: success, size=%d bytes type=%s", len(body), contentType)
 	return body, contentType, nil

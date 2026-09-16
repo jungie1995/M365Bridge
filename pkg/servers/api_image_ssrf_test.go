@@ -77,7 +77,7 @@ func TestBuildOpenAIImageDataDropsDisallowedHosts(t *testing.T) {
 	api := newImageTestServer()
 	text := "![a](https://attacker.example/leak.png)\n![b](https://evil-officeapps.live.com/x.png)"
 
-	items := api.buildOpenAIImageData(text, 0, "prompt", "b64_json")
+	items, _ := api.buildOpenAIImageData(text, 0, "prompt", "b64_json")
 	if len(items) != 0 {
 		t.Fatalf("got %d items, want 0; a disallowed URL must not reach the client: %#v", len(items), items)
 	}

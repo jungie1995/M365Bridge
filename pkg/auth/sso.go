@@ -919,6 +919,9 @@ func brokerBrowserRequest(target, referer, cookieHeader string) (*http.Request, 
 	if err != nil {
 		return nil, err
 	}
+	if req.URL.Scheme != "https" || req.URL.Host != "login.microsoftonline.com" || req.URL.User != nil {
+		return nil, errors.New("broker authorization redirect left the permitted Microsoft login host")
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	if referer != "" {
@@ -961,10 +964,11 @@ func followBrokerRedirects(client *http.Client, resp *http.Response, cookieHeade
 		if err != nil {
 			return "", err
 		}
-		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d -> %s", i, location[:min(120, len(location))])
+		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d", i)
 
 		// The final redirect is brk_redirect_uri, which is on the M365 host.
-		if strings.Contains(location, "m365.cloud.microsoft") {
+		target, parseErr := url.Parse(location)
+		if parseErr == nil && target.Scheme == "https" && target.Host == "m365.cloud.microsoft" && target.User == nil && target.Path == "/spalanding" {
 			authCode, codeErr := brokerAuthCodeFromRedirect(location)
 			if codeErr != nil {
 				return "", codeErr

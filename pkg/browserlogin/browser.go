@@ -86,6 +86,7 @@ type browser struct {
 	session   string
 	challenge *auth.BrowserChallenge
 	callback  string
+	designer  *designerObserver
 }
 
 func (b *browser) send(method string, params any, session string) (int, error) {
@@ -110,6 +111,7 @@ func (b *browser) read(ctx context.Context) (message, error) {
 		return event, errors.New("sign-in was interrupted or timed out; open the sign-in window again")
 	}
 	if event.SessionID == b.session {
+		b.observeDesigner(event)
 		switch event.Method {
 		case "Fetch.requestPaused":
 			b.observePaused(event.Params)
@@ -263,14 +265,27 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 		return err
 	}
 	if firstLogin {
-		err = tm.CompleteBrowserSetup(ctx, challenge, b.callback, login, portal, setup.SaveBrowserIdentity)
+		err = tm.CompleteBrowserSetup(ctx, challenge, b.callback, login, portal, func(tenant, oid string) error {
+			if err := setup.SaveBrowserIdentity(tenant, oid); err != nil {
+				return err
+			}
+			config.TenantID, config.UserOID = tenant, oid
+			return nil
+		})
 	} else {
 		err = tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal)
 	}
 	if err != nil {
 		return err
 	}
-	_ = writeStatus(options, "connected", "Microsoft account connected. Saved credentials and session cookies are available for automatic renewal.")
+	// A first sign-in discovers the identity. Use that verified identity for the
+	// separate Designer exchange, never the temporary organizations tenant.
+	designer := auth.NewTokenManager(config.TenantID, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
+	designer.SetUserOID(config.UserOID)
+	if err := b.completeDesigner(ctx, options, designer, config.TenantID); err != nil {
+		return err
+	}
+	_ = writeStatus(options, "connected", "Microsoft text and Designer image credentials saved for this account. Automatic renewal is available while Microsoft permits it; reconnect here if interaction is required again.")
 	return nil
 }
 

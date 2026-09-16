@@ -32,6 +32,7 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 
 - Text chat, streaming and non-streaming
 - Image input on both protocols, and image generation through Microsoft Designer
+- Guided Windows login completes both text and separate Designer authorization; see [Windows setup and reconnect](docs/WINDOWS_SETUP.md). A small disclosed image check may appear in Copilot history. No manual broker-token copying is needed.
 - Multi-turn conversations, with each session mapped to its own M365 conversation
 - Reasoning content exposed as `reasoning_content` (OpenAI) and `thinking` blocks (Anthropic)
 - Tool calling for client-defined tools on both protocols, streaming and non-streaming
