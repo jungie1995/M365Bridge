@@ -509,6 +509,12 @@ func verifyToken(tenant, oid, refreshToken string) (string, string, error) {
 }
 
 // saveEnv saves the environment configuration to .env file.
+// SaveBrowserIdentity saves a verified browser account while preserving the
+// installation's gateway key and other operator settings.
+func SaveBrowserIdentity(tenant, oid string) error {
+	return saveEnv(tenant, oid)
+}
+
 func saveEnv(tenant, oid string) error {
 	existing, err := os.ReadFile(defaultEnvFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {

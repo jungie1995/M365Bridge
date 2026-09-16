@@ -2,8 +2,10 @@ package servers
 
 import (
 	"encoding/json"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -24,6 +26,28 @@ func TestV1HealthReportsReachability(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Fatalf("status field = %q, want ok", body["status"])
+	}
+}
+
+func TestReadinessDistinguishesImagesFromTextWithoutInferringUpstreamAccess(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_ = os.MkdirAll("data/tokens", 0700)
+	_ = os.WriteFile("data/tokens/rt_90day.txt", []byte("encrypted-fixture"), 0600)
+	api := &APIServer{config: &models.Config{TenantID: "fixture-tenant", UserOID: "fixture-user"}}
+	for _, mode := range []string{"", "1"} {
+		t.Setenv("M365_BROWSER_IMAGE_ROUTING", mode)
+		w := httptest.NewRecorder()
+		api.handleBridgeReadiness(w, httptest.NewRequest(http.MethodGet, "/v1/bridge/readiness", nil))
+		var body map[string]any
+		if json.Unmarshal(w.Body.Bytes(), &body) != nil {
+			t.Fatal("invalid JSON")
+		}
+		if body["image_routing"] != (mode == "1") || body["upstream_verified"] != false || body["credential_saved"] != true {
+			t.Fatal("misleading readiness")
+		}
+		if _, exists := body["tenant"]; exists {
+			t.Fatal("identity leaked")
+		}
 	}
 }
 

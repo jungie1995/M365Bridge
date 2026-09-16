@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -36,6 +37,7 @@ func (tm *TokenManager) BeginBrowserLogin() (*BrowserChallenge, error) {
 		"redirect_uri": {defaultRedirectURI}, "scope": {tm.scope},
 		"response_mode": {"query"}, "code_challenge": {challenge},
 		"code_challenge_method": {"S256"}, "state": {state},
+		"prompt": {"select_account"},
 	}
 	return &BrowserChallenge{AuthorizationURL: fmt.Sprintf(authorizeURLTemplate, tm.tenant) + "?" + params.Encode(), verifier: verifier, state: state}, nil
 }
@@ -82,6 +84,38 @@ func browserAccountMatches(token, tenant, oid string) bool {
 // CompleteBrowserLogin validates the callback and identity before touching the
 // existing bridge credentials. Tokens come directly from Microsoft's HTTPS endpoint.
 func (tm *TokenManager) CompleteBrowserLogin(ctx context.Context, challenge *BrowserChallenge, callback string, loginCookies, webCookies []SSOCookie) error {
+	return tm.completeBrowserLogin(ctx, challenge, callback, loginCookies, webCookies, nil)
+}
+
+// CompleteBrowserSetup permits account discovery only for a completely new
+// installation. Identity is taken from the token redeemed over Microsoft's TLS
+// endpoint, never from callback parameters or a user-provided token export.
+func (tm *TokenManager) CompleteBrowserSetup(ctx context.Context, challenge *BrowserChallenge, callback string, loginCookies, webCookies []SSOCookie, persistIdentity func(string, string) error) error {
+	if tm.tenant != "organizations" || tm.userOID != "" || persistIdentity == nil {
+		return errors.New("automatic account discovery is only available on a new installation")
+	}
+	return tm.completeBrowserLogin(ctx, challenge, callback, loginCookies, webCookies, persistIdentity)
+}
+
+var browserGUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func browserIdentity(token string) (string, string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) == 3 {
+		data, err := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims struct {
+			Tenant   string `json:"tid"`
+			OID      string `json:"oid"`
+			Audience string `json:"aud"`
+		}
+		if err == nil && json.Unmarshal(data, &claims) == nil && browserGUID.MatchString(claims.Tenant) && browserGUID.MatchString(claims.OID) && claims.Audience == "https://substrate.office.com/sydney" && claims.Tenant != "00000000-0000-0000-0000-000000000000" && claims.OID != "00000000-0000-0000-0000-000000000000" {
+			return claims.Tenant, claims.OID, nil
+		}
+	}
+	return "", "", errors.New("Microsoft did not return a valid work or school account identity for this bridge")
+}
+
+func (tm *TokenManager) completeBrowserLogin(ctx context.Context, challenge *BrowserChallenge, callback string, loginCookies, webCookies []SSOCookie, persistIdentity func(string, string) error) error {
 	tm.refreshMu.Lock()
 	defer tm.refreshMu.Unlock()
 	code, err := browserAuthorizationCode(challenge, callback)
@@ -92,6 +126,16 @@ func (tm *TokenManager) CompleteBrowserLogin(ctx context.Context, challenge *Bro
 	if err != nil {
 		return browserExchangeError(err)
 	}
+	if persistIdentity != nil {
+		tenant, oid, err := browserIdentity(tokens.AccessToken)
+		if err != nil {
+			return err
+		}
+		// Temporarily pin discovered claims for the same validation used on reconnect.
+		previousTenant, previousOID := tm.tenant, tm.userOID
+		tm.tenant, tm.userOID = tenant, oid
+		defer func() { tm.tenant, tm.userOID = previousTenant, previousOID }()
+	}
 	if err := tm.validateBrowserCredentials(tokens, loginCookies); err != nil {
 		return err
 	}
@@ -100,6 +144,11 @@ func (tm *TokenManager) CompleteBrowserLogin(ctx context.Context, challenge *Bro
 	}
 	if err := tm.saveBrowserCredentials(tokens, loginCookies, webCookies); err != nil {
 		return err
+	}
+	if persistIdentity != nil {
+		if err := persistIdentity(tm.tenant, tm.userOID); err != nil {
+			return errors.New("signed in, but account configuration could not be saved; check the private data folder permissions and reconnect")
+		}
 	}
 	challenge.state, challenge.verifier = "", ""
 	return nil

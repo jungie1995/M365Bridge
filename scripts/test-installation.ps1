@@ -8,13 +8,14 @@ New-Item -ItemType Directory -Path $TestRoot | Out-Null
 $source = Split-Path -Parent $PSScriptRoot
 $runningBefore = @(Get-Process -Name 'm365-bridge','m365-bridge-images' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
 $install = Join-Path $TestRoot 'fresh install with spaces'
-& (Join-Path $PSScriptRoot 'install-bridge.ps1') -InstallRoot $install -SourceRoot $source -GoExecutable $GoExecutable -NoStart
+& (Join-Path $PSScriptRoot 'install-bridge.ps1') -InstallRoot $install -SourceRoot $source -GoExecutable $GoExecutable -TextPort 18000 -ImagePort 18001 -NoStart
 $names = @('m365-bridge.exe','m365-bridge-images.exe','m365-bridge-browser-login.exe')
 $manifest = [IO.File]::ReadAllText((Join-Path $install 'install-manifest.json')) | ConvertFrom-Json
 foreach ($name in $names) {
     if ((Get-FileHash -LiteralPath (Join-Path $install $name)).Hash -ne $manifest.sha256) { throw 'Fresh binary aliases differ.' }
 }
 if ($manifest.repository -ne 'https://github.com/jungie1995/M365Bridge') { throw 'Wrong source repository recorded.' }
+if ($manifest.setup_version -ne 2) { throw 'First-login setup contract was not recorded.' }
 $settingsPath = Join-Path $install 'data\.env'
 $settings = [IO.File]::ReadAllText($settingsPath)
 if ($settings -notmatch '(?m)^M365_API_KEY=[0-9a-f]{64}\r?$' -or $settings -notmatch 'M365_MAX_TOOL_ROUNDS=128') { throw 'Fresh installation defaults were not initialized.' }
@@ -34,6 +35,7 @@ foreach ($path in $protected) {
 }
 $updated = [IO.File]::ReadAllText((Join-Path $install 'install-manifest.json')) | ConvertFrom-Json
 if ($updated.revision -ne 'installation-regression') { throw 'Upgrade manifest was not updated.' }
+if ($updated.text_port -ne 18000 -or $updated.image_port -ne 18001) { throw 'Upgrade reset the configured custom ports.' }
 $unpatched = Join-Path $TestRoot 'unpatched.ps1'
 [IO.File]::WriteAllText($unpatched,'"Stock bridge help"')
 $rejected = $false

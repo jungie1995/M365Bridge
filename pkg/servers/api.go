@@ -392,6 +392,7 @@ func (api *APIServer) Start(port int) error {
 	// 404 as an unreachable provider. It stays public alongside /v1/models
 	// because the probe carries no credential.
 	mux.HandleFunc("/v1/health", api.handleV1Health)
+	mux.HandleFunc("/v1/bridge/readiness", api.withAuth(api.handleBridgeReadiness))
 	// The browser interface is served without a credential, so it has to be
 	// told what to ask for before it can ask. Both routes are public for that
 	// reason: one reports which gate to show, the other says whether an offered
@@ -598,6 +599,23 @@ func (api *APIServer) handleV1Health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	api.sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// Configuration evidence only: this never performs inference or claims an
+// upstream login/license is valid just because a local port is reachable.
+func (api *APIServer) handleBridgeReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		api.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	account := api.config != nil && api.config.TenantID != "" && api.config.UserOID != ""
+	_, credentialErr := os.Stat("data/tokens/rt_90day.txt")
+	api.sendJSON(w, http.StatusOK, map[string]any{
+		"bridge": "M365Bridge", "setup_version": 2,
+		"account_configured": account, "credential_saved": credentialErr == nil,
+		"image_routing":     os.Getenv("M365_BROWSER_IMAGE_ROUTING") == "1",
+		"upstream_verified": false,
+	})
 }
 
 // handleModels handles model list requests.

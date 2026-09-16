@@ -302,6 +302,13 @@ var DefaultImageHostAllowlist = []string{".officeapps.live.com"}
 // LoadConfig loads configuration from .env file and environment variables.
 // Returns configuration with defaults for missing values.
 func LoadConfig() *Config {
+	// Managed Windows launchers use this installation's identity/key, not stale
+	// values inherited from another PC or an old scheduled-task environment.
+	if os.Getenv("M365_CONFIG_FROM_INSTALLATION") == "1" {
+		for _, key := range []string{"M365_TENANT_ID", "M365_USER_OID", "M365_CLIENT_ID", "M365_API_KEY", "M365_API_KEYS"} {
+			_ = os.Unsetenv(key)
+		}
+	}
 	// Load .env file if it exists
 	loadDotEnv()
 
@@ -379,6 +386,9 @@ func loadDotEnv() {
 
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
+			value = value[1 : len(value)-1]
+		}
 
 		// Only set if not already in environment (env vars take precedence)
 		if os.Getenv(key) == "" {

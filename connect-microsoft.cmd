@@ -1,5 +1,6 @@
 @echo off
-pushd "%~dp0"
-"%~dp0m365-bridge-browser-login.exe" login-browser
-if errorlevel 1 pause
-popd
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\connect-microsoft.ps1" -InstallRoot "%~dp0."
+if errorlevel 1 (
+  pause
+  exit /b 1
+)

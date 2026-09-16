@@ -13,6 +13,29 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/atomicfile"
 )
 
+func TestAcquireDesignerTokenBootstrapsOnANewComputer(t *testing.T) {
+	useTemporaryWorkingDirectory(t)
+	tm := NewTokenManager("new-tenant", "client", "scope", "refresh", "cache")
+	if _, err := tm.readBrokerRefreshToken(); err == nil {
+		t.Fatal("fresh installation unexpectedly has an image broker credential")
+	}
+	acquisitions := 0
+	tm.brokerTokenAcquisition = func() (string, error) {
+		acquisitions++
+		return "new-computer-broker-token", nil
+	}
+	tm.designerTokenRequest = func(refreshToken string) (string, int, error) {
+		if refreshToken != "new-computer-broker-token" {
+			t.Fatal("image exchange did not use the newly acquired broker credential")
+		}
+		return "designer-fixture-token", 3600, nil
+	}
+	token, expiresIn, err := tm.acquireDesignerToken()
+	if err != nil || token != "designer-fixture-token" || expiresIn != 3600 || acquisitions != 1 {
+		t.Fatal("fresh image broker bootstrap failed")
+	}
+}
+
 func TestAcquireDesignerTokenReacquiresExpiredBrokerToken(t *testing.T) {
 	useTemporaryWorkingDirectory(t)
 	tm := NewTokenManager("tenant", "client", "scope", "refresh", "cache")

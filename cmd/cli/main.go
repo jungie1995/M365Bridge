@@ -89,7 +89,7 @@ func isHelpFlag(arg string) bool {
 func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintf(w, `M365Bridge v%s - Microsoft 365 Copilot as an OpenAI and Anthropic API
 
-Fork capabilities: task-continuity, browser-reconnect, browser-image-routing
+Fork capabilities: task-continuity, browser-reconnect, browser-image-routing, browser-first-login
 
 USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode

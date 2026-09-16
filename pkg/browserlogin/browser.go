@@ -18,6 +18,7 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/atomicfile"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/setup"
 	"github.com/gorilla/websocket"
 )
 
@@ -207,9 +208,6 @@ func portalCookie(domain string) bool {
 }
 
 func Run(parent context.Context, config *models.Config, options Options) (result error) {
-	if config.TenantID == "" || config.UserOID == "" {
-		return errors.New("configure the bridge's Microsoft account once before using browser reconnect")
-	}
 	unlock, err := acquireLoginLock()
 	if err != nil {
 		return err
@@ -220,6 +218,9 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 			_ = writeStatus(options, "failed", result.Error())
 		}
 	}()
+	if (config.TenantID == "") != (config.UserOID == "") {
+		return errors.New("Microsoft account configuration is incomplete; restore both account IDs from this installation's backup before reconnecting")
+	}
 	if err := writeStatus(options, "starting", "Opening a dedicated Microsoft Edge sign-in window."); err != nil {
 		return errors.New("could not write browser sign-in status")
 	}
@@ -232,7 +233,12 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 }
 
 func runSignIn(ctx context.Context, config *models.Config, options Options) error {
-	tm := auth.NewTokenManager(config.TenantID, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
+	tenant := config.TenantID
+	firstLogin := tenant == "" && config.UserOID == ""
+	if firstLogin {
+		tenant = "organizations"
+	}
+	tm := auth.NewTokenManager(tenant, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
 	tm.SetUserOID(config.UserOID)
 	challenge, err := tm.BeginBrowserLogin()
 	if err != nil {
@@ -256,7 +262,12 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	if err != nil {
 		return err
 	}
-	if err := tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal); err != nil {
+	if firstLogin {
+		err = tm.CompleteBrowserSetup(ctx, challenge, b.callback, login, portal, setup.SaveBrowserIdentity)
+	} else {
+		err = tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal)
+	}
+	if err != nil {
 		return err
 	}
 	_ = writeStatus(options, "connected", "Microsoft account connected. Saved credentials and session cookies are available for automatic renewal.")

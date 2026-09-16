@@ -25,7 +25,7 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 ## Requirements
 
 - A **Microsoft 365 Copilot license**. A business or enterprise account with Copilot access. A Copilot Chat (basic) account has also been tested.
-- A **browser signed in** to [m365.cloud.microsoft](https://m365.cloud.microsoft). You will collect credentials from it once during setup.
+- **Microsoft Edge on Windows** for the guided first-time browser sign-in and reconnect. No account-ID/token copying or browser-console export is needed for that flow. Docker/manual setup is documented separately below.
 - **Docker**, or **Go 1.26.6+** if you build from source. Go 1.21 and newer also work, because they download the 1.26.6 toolchain on the first build, unless `GOTOOLCHAIN` is set to `local`. The patch level is part of the requirement: every release before 1.26.6 carries standard-library vulnerabilities this service reaches through its own HTTP and TLS paths.
 
 ## Features
@@ -52,6 +52,12 @@ Build this fork from source, either with the Windows installer below or Docker. 
 
 ### Windows: fresh installation and upgrades
 
+Recommended: clone this repository and double-click **setup-bridge.cmd**. It installs missing Git/Go dependencies with Windows Package Manager, builds this fork, installs it into `%LOCALAPPDATA%\M365Bridge`, and opens a dedicated Edge sign-in window. Sign in to your Microsoft work/school account and complete MFA. Both local services start after successful login.
+
+For Content Studio V1 users, its **install-with-m365.cmd** combines both installations and configures the application automatically. Do not copy another computer's `.env`, token files, encrypted caches or global Codex profile. See [the Windows setup guide](docs/WINDOWS_SETUP.md).
+
+Advanced installation into an existing location:
+
 Install Git and Go 1.26.6 or newer, then:
 
 ```powershell
@@ -61,7 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\M365Bridge\scripts\install
 
 Use `-GoExecutable "C:\path\to\go.exe"` when Go is not on PATH. The installer builds the current checkout, checks the fork capabilities, installs text/image/browser-login binaries from the same build, and records the revision and SHA-256 in `install-manifest.json`. A fresh installation creates a private random API key and a 128-round tool budget in `data/.env`; the key is never printed. Existing configuration, tokens, cookies, caches and transcripts are preserved.
 
-For a fresh account, follow [Connecting your account](#connecting-your-microsoft-365-account), running `setup-wizard` from `C:\m365bridge`. Setup updates Microsoft identity fields while preserving the API key and other settings. Then start the text API on 8000 and the image API on 8001:
+For a fresh account, run `C:\m365bridge\connect-microsoft.cmd`. The browser flow discovers verified account IDs automatically while preserving the API key and other settings. Later reconnects use that same button and reject a different account. To start the text API on 8000 and the image API on 8001 without signing in again:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\m365bridge\scripts\start-bridge.ps1

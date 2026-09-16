@@ -7,10 +7,17 @@ param(
     [switch]$NoStart
 )
 $ErrorActionPreference = 'Stop'
+$existingManifest = Join-Path $InstallRoot 'install-manifest.json'
+if (Test-Path -LiteralPath $existingManifest) {
+    $existing = Get-Content -LiteralPath $existingManifest -Raw | ConvertFrom-Json
+    if (-not $PSBoundParameters.ContainsKey('TextPort')) { $TextPort = [int]$existing.text_port }
+    if (-not $PSBoundParameters.ContainsKey('ImagePort')) { $ImagePort = [int]$existing.image_port }
+}
+if ($TextPort -lt 1024 -or $TextPort -gt 65535 -or $ImagePort -lt 1024 -or $ImagePort -gt 65535 -or $TextPort -eq $ImagePort) { throw 'Choose two distinct ports between 1024 and 65535.' }
 if (-not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) { throw 'Candidate binary does not exist.' }
 $candidate = (Resolve-Path -LiteralPath $CandidatePath).Path
 $help = (& $candidate --help 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0 -or $help -notmatch 'task-continuity' -or $help -notmatch 'login-browser') {
+if ($LASTEXITCODE -ne 0 -or $help -notmatch 'task-continuity' -or $help -notmatch 'browser-first-login') {
     throw 'Candidate is not the edited M365Bridge fork; build this repository before installing.'
 }
 if (-not (Test-Path -LiteralPath $InstallRoot -PathType Container)) {
@@ -77,8 +84,10 @@ function Stop-BridgeProcesses {
 function Start-BridgeProcesses {
     if (-not $startAfterInstall) { return }
     $previousRoute = $env:M365_BROWSER_IMAGE_ROUTING
+    $previousConfigSource = $env:M365_CONFIG_FROM_INSTALLATION
     try {
-        $env:M365_BROWSER_IMAGE_ROUTING = $null
+        $env:M365_CONFIG_FROM_INSTALLATION = '1'
+        $env:M365_BROWSER_IMAGE_ROUTING = '0'
         Start-Process -FilePath (Join-Path $InstallRoot 'm365-bridge.exe') -ArgumentList 'serve','--port',"$TextPort" -WorkingDirectory $InstallRoot -WindowStyle Hidden
         if ($imageTask) {
             Start-ScheduledTask -InputObject $imageTask
@@ -88,6 +97,7 @@ function Start-BridgeProcesses {
         }
     } finally {
         $env:M365_BROWSER_IMAGE_ROUTING = $previousRoute
+        $env:M365_CONFIG_FROM_INSTALLATION = $previousConfigSource
     }
     $deadline = (Get-Date).AddSeconds(30)
     do {
@@ -119,6 +129,6 @@ try {
     Start-BridgeProcesses
     throw $failure
 }
-$manifest = [ordered]@{ repository = 'https://github.com/jungie1995/M365Bridge'; revision = $SourceRevision; sha256 = $hash; installed = $targets; text_port = $TextPort; image_port = $ImagePort; installed_at = (Get-Date).ToUniversalTime().ToString('o') }
+$manifest = [ordered]@{ setup_version = 2; repository = 'https://github.com/jungie1995/M365Bridge'; revision = $SourceRevision; sha256 = $hash; installed = $targets; text_port = $TextPort; image_port = $ImagePort; installed_at = (Get-Date).ToUniversalTime().ToString('o') }
 [IO.File]::WriteAllText((Join-Path $InstallRoot 'install-manifest.json'),($manifest | ConvertTo-Json -Depth 3),[Text.UTF8Encoding]::new($false))
 [pscustomobject]@{ sha256 = $hash; revision = $SourceRevision; installed = $targets; backups = $backups; started = $startAfterInstall; account_setup_required = (-not (Test-Path -LiteralPath (Join-Path $data 'tokens\token_cache.json'))) } | ConvertTo-Json -Depth 3
