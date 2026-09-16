@@ -63,12 +63,25 @@ if (-not (Test-Path -LiteralPath $data)) {
     Set-Acl -LiteralPath $data -AclObject $acl
 }
 $envFile = Join-Path $data '.env'
-if (-not (Test-Path -LiteralPath $envFile)) {
+$envContents = ''
+if (Test-Path -LiteralPath $envFile) { $envContents = [IO.File]::ReadAllText($envFile) }
+$hasGatewayKey = $false
+foreach ($match in [regex]::Matches($envContents, '(?m)^\s*M365_API_KEYS?\s*=([^\r\n]*)')) {
+    $value = $match.Groups[1].Value.Trim().Trim([char]34).Trim([char]39)
+    if (@($value.Split(',') | Where-Object { $_.Trim() }).Count -gt 0) { $hasGatewayKey = $true }
+}
+if (-not $hasGatewayKey) {
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $key = [BitConverter]::ToString($bytes).Replace('-','').ToLowerInvariant()
-    [IO.File]::WriteAllText($envFile,"# Local gateway settings; keep private.`nM365_API_KEY=$key`nM365_MAX_TOOL_ROUNDS=128`nM365_ENABLE_CODE_TOOLS=0`n",[Text.UTF8Encoding]::new($false))
+    # Older installations may have account settings but only an inherited key.
+    # Keep the account data and supply a private local key, never a shared default.
+    $envContents = [regex]::Replace($envContents, '(?m)^\s*M365_API_KEYS?\s*=[^\r\n]*\r?\n?', '')
+    $envContents = $envContents.TrimEnd() + "`n# Local gateway settings; keep private.`nM365_API_KEY=$key`n"
+    if ($envContents -notmatch '(?m)^M365_MAX_TOOL_ROUNDS=') { $envContents += "M365_MAX_TOOL_ROUNDS=128`n" }
+    if ($envContents -notmatch '(?m)^M365_ENABLE_CODE_TOOLS=') { $envContents += "M365_ENABLE_CODE_TOOLS=0`n" }
+    [IO.File]::WriteAllText($envFile,$envContents,[Text.UTF8Encoding]::new($false))
 }
 
 function Stop-BridgeProcesses {

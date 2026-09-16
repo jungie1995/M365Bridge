@@ -29,6 +29,17 @@ $protected = @($settingsPath,(Join-Path $tokenDir 'token_cache.json'),(Join-Path
 $before = @{}
 foreach ($path in $protected) { $before[$path] = (Get-FileHash -LiteralPath $path).Hash }
 $candidate = Join-Path $source 'bin\m365-bridge-install-candidate.exe'
+# Reproduce a legacy installation that has account settings but no private key.
+$legacy = Join-Path $TestRoot 'legacy missing key'
+New-Item -ItemType Directory -Path (Join-Path $legacy 'data') -Force | Out-Null
+$legacyEnv = Join-Path $legacy 'data\.env'
+[IO.File]::WriteAllText($legacyEnv,"M365_TENANT_ID=fixture-tenant`nM365_API_KEY=`nM365_MAX_TOOL_ROUNDS=64`n")
+& (Join-Path $PSScriptRoot 'install-verified-bridge.ps1') -InstallRoot $legacy -CandidatePath $candidate -SourceRevision 'legacy-key-regression' -NoStart
+$legacySettings = [IO.File]::ReadAllText($legacyEnv)
+if ($legacySettings -notmatch '(?m)^M365_API_KEY=[0-9a-f]{64}\r?$' -or $legacySettings -notmatch 'M365_TENANT_ID=fixture-tenant' -or $legacySettings -notmatch 'M365_MAX_TOOL_ROUNDS=64') { throw 'Legacy missing-key repair did not preserve account settings.' }
+$legacyHash = (Get-FileHash -LiteralPath $legacyEnv).Hash
+& (Join-Path $PSScriptRoot 'install-verified-bridge.ps1') -InstallRoot $legacy -CandidatePath $candidate -SourceRevision 'legacy-key-repeat' -NoStart
+if ((Get-FileHash -LiteralPath $legacyEnv).Hash -ne $legacyHash) { throw 'Repeated setup replaced the repaired private key.' }
 & (Join-Path $PSScriptRoot 'install-verified-bridge.ps1') -InstallRoot $install -CandidatePath $candidate -SourceRevision 'installation-regression' -NoStart
 foreach ($path in $protected) {
     if ((Get-FileHash -LiteralPath $path).Hash -ne $before[$path]) { throw 'Upgrade changed existing account/configuration data.' }
