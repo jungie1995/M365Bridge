@@ -250,8 +250,7 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	if err != nil {
 		return err
 	}
-	defer b.conn.Close()
-	defer func() { _, _ = b.send("Browser.close", map[string]any{}, "") }()
+	defer b.close()
 	stopWatching := watchBrowserCancellation(ctx, b.conn)
 	defer stopWatching()
 	if err := b.attachSignIn(ctx); err != nil {
@@ -287,6 +286,16 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	}
 	_ = writeStatus(options, "connected", "Microsoft text and Designer image credentials saved for this account. Automatic renewal is available while Microsoft permits it; reconnect here if interaction is required again.")
 	return nil
+}
+
+func (b *browser) close() {
+	defer b.conn.Close()
+	// Keep the connection alive until Edge acknowledges the close request or
+	// disconnects. Closing the socket immediately after sending can leave the
+	// dedicated setup window open even though credential saving succeeded.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = b.call(ctx, "Browser.close", map[string]any{}, "")
 }
 
 func browserProfile() (string, error) {
