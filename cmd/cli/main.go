@@ -66,9 +66,7 @@ func main() {
 			runBrowserLogin(os.Args[2:])
 			return
 		case "login":
-			// Codex-style spelling for the same local browser reconnect flow.
-			// Keep login-browser as an explicit compatibility command.
-			runBrowserLogin(os.Args[2:])
+			runLogin(os.Args[2:])
 			return
 		}
 	}
@@ -294,6 +292,20 @@ func runBrowserLogin(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("Microsoft account connected. Credentials were saved locally; no browser export is required.")
+}
+
+// runLogin captures the standard, broker, and browser credentials in one
+// interactive login. login-browser remains available for reconnecting an
+// existing Edge session used by image/web-session features.
+func runLogin(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	fs.Usage = func() { printUsage(os.Stdout) }
+	browser := fs.String("browser", "", "Browser executable to drive; empty discovers installed Chrome")
+	_ = fs.Parse(args)
+	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser}); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runCLI runs the default CLI mode (single query or interactive).
