@@ -779,12 +779,20 @@ Model selection travels in the `tone` field the M365 backend reads. GPT and Clau
 | `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | No | GPT selector |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | No | GPT selector |
 | `gpt6-astra`               | GPT_6_Astra | gpt-6-astra | No | GPT selector |
+| `claude-fable`             | Claude_Fable | claude-fable | No | Experimental selector |
+| `grok-4.5`                 | Grok_4_5 | grok-4.5 | No | Experimental selector |
+| `grok-auto`                | Grok_Auto | grok-auto | No | Experimental selector |
+| `grok-reasoning`           | Grok_Reasoning | grok-reasoning | No | Experimental selector |
+| `muse-spark`               | Muse_Spark | muse-spark | No | Experimental selector |
+| `claude-sonnet-think-deeper` | Claude_Sonnet_Reasoning | claude-sonnet-reasoning | No | Experimental selector |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 
 ### Which one to use
+
+Fable, Grok, Muse Spark, and Sonnet Think deeper are available as experimental Microsoft 365 selectors. Each passed arithmetic and code-comprehension requests; none supplied authoritative vendor/model identity or thinking content in those probes. Their `owned_by` stays `microsoft-365` and their display names say experimental. Use the OpenAI ID from the table in the request's `model` field with your existing bridge base URL and API key, for example `{"model":"claude-fable","messages":[{"role":"user","content":"Hello"}]}`. Standard Sonnet remains `claude-sonnet-4.6`; the experimental Think deeper selector uses `claude-sonnet-reasoning`.
 
 The new GPT selectors follow [upstream's October 3, 2026 tone probes](https://github.com/KilimcininKorOglu/M365Bridge/blob/ed900c703f71bae737864f8e1db0e0dd148c4bce/CHANGELOG.md#152---2026-10-03). A successful probe confirms that a tone completed a turn on the tested account, not the identity of the underlying model or availability on every account. The Microsoft 365 picker labels appear as `display_name`: **GPT-6 Sol** (`gpt-6-sol`), **GPT-5.6 Sol Think deeper** (`gpt-5.6-reasoning`), and **GPT-5.6 Sol Quick response** (`gpt-5.6`). GPT-6 Sol has not been observed emitting thinking content. The default remains `gpt5.5-reasoning` for existing clients.
 

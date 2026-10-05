@@ -175,6 +175,8 @@ var wantEffort = map[string]bool{
 	"gpt-5.2-reasoning": true, "gpt-5.4-reasoning": true,
 	"gpt-5.5": true, "gpt-5.5-reasoning": true, "gpt-5.6-reasoning": true,
 	"gpt-5.6": true, "gpt-6-sol": false, "gpt-6-astra": false,
+	"claude-fable": false, "grok-4.5": false, "grok-auto": false,
+	"grok-reasoning": true, "muse-spark": false, "claude-sonnet-reasoning": false,
 	"claude-sonnet-4.6": false, "claude-opus-4.6": false,
 }
 
@@ -184,6 +186,8 @@ var wantThinking = map[string]bool{
 	"gpt-5.2-reasoning": true, "gpt-5.4-reasoning": true,
 	"gpt-5.5": false, "gpt-5.5-reasoning": true, "gpt-5.6-reasoning": true,
 	"gpt-5.6": false, "gpt-6-sol": false, "gpt-6-astra": false,
+	"claude-fable": false, "grok-4.5": false, "grok-auto": false,
+	"grok-reasoning": false, "muse-spark": false, "claude-sonnet-reasoning": false,
 	"claude-sonnet-4.6": false, "claude-opus-4.6": true,
 }
 

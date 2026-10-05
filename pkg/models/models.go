@@ -195,6 +195,40 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "gpt-6-astra",
 		DisplayName: "GPT-6 Astra",
 	},
+	// Experimental M365 selectors passed live arithmetic and code-comprehension
+	// checks on 2026-10-05. Their replies did not attest the named vendor/model
+	// and emitted no thinking content, so ownership stays Microsoft and Thinking
+	// stays false. Existing Claude entries below retain their measured metadata.
+	"claude-fable": {
+		Tone:        "Claude_Fable",
+		OpenAIID:    "claude-fable",
+		DisplayName: "Claude Fable selector (experimental)",
+	},
+	"grok-4.5": {
+		Tone:        "Grok_4_5",
+		OpenAIID:    "grok-4.5",
+		DisplayName: "Grok 4.5 selector (experimental)",
+	},
+	"grok-auto": {
+		Tone:        "Grok_Auto",
+		OpenAIID:    "grok-auto",
+		DisplayName: "Grok Auto selector (experimental)",
+	},
+	"grok-reasoning": {
+		Tone:        "Grok_Reasoning",
+		OpenAIID:    "grok-reasoning",
+		DisplayName: "Grok Reasoning selector (experimental)",
+	},
+	"muse-spark": {
+		Tone:        "Muse_Spark",
+		OpenAIID:    "muse-spark",
+		DisplayName: "Muse Spark selector (experimental)",
+	},
+	"claude-sonnet-think-deeper": {
+		Tone:        "Claude_Sonnet_Reasoning",
+		OpenAIID:    "claude-sonnet-reasoning",
+		DisplayName: "Sonnet Think deeper selector (experimental)",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:        "Claude_Sonnet",

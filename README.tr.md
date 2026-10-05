@@ -735,12 +735,20 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT ve Cl
 | `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | Hayır | GPT selector |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | Hayır | GPT selector |
 | `gpt6-astra`               | GPT_6_Astra | gpt-6-astra | Hayır | GPT selector |
+| `claude-fable`             | Claude_Fable | claude-fable | Hayır | Deneysel seçici |
+| `grok-4.5`                 | Grok_4_5 | grok-4.5 | Hayır | Deneysel seçici |
+| `grok-auto`                | Grok_Auto | grok-auto | Hayır | Deneysel seçici |
+| `grok-reasoning`           | Grok_Reasoning | grok-reasoning | Hayır | Deneysel seçici |
+| `muse-spark`               | Muse_Spark | muse-spark | Hayır | Deneysel seçici |
+| `claude-sonnet-think-deeper` | Claude_Sonnet_Reasoning | claude-sonnet-reasoning | Hayır | Deneysel seçici |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 
 ### Hangisini kullanmalı
+
+Fable, Grok, Muse Spark ve Sonnet Think deeper deneysel Microsoft 365 seçicileri olarak kullanılabilir. Her biri aritmetik ve kod anlama testlerini geçti; testlerde kesin sağlayıcı/model kimliği veya thinking içeriği doğrulanmadı. `owned_by` değeri `microsoft-365` olarak kalır ve görünen adları experimental olarak işaretlenir. Mevcut bridge adresiniz ve API anahtarınızla isteğin `model` alanında tablodaki OpenAI ID'yi kullanın; örneğin `{"model":"claude-fable","messages":[{"role":"user","content":"Hello"}]}`. Standart Sonnet `claude-sonnet-4.6`, deneysel Think deeper seçicisi ise `claude-sonnet-reasoning` adını kullanır.
 
 Yeni GPT seçicileri, [upstream'in 3 Ekim 2026 tone testlerinden](https://github.com/KilimcininKorOglu/M365Bridge/blob/ed900c703f71bae737864f8e1db0e0dd148c4bce/CHANGELOG.md#152---2026-10-03) alınmıştır. Başarılı bir test, tone'un test edilen hesapta yanıt verdiğini gösterir; alttaki modelin kimliğini veya her hesapta kullanılabilirliğini doğrulamaz. Microsoft 365 seçicisinin etiketleri `display_name` alanında sunulur: **GPT-6 Sol** (`gpt-6-sol`), **GPT-5.6 Sol Think deeper** (`gpt-5.6-reasoning`) ve **GPT-5.6 Sol Quick response** (`gpt-5.6`). GPT-6 Sol'da thinking içeriği gözlenmemiştir. Mevcut istemciler için varsayılan `gpt5.5-reasoning` olarak kalır.
 
