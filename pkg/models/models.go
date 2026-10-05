@@ -190,6 +190,11 @@ var ModelRegistry = map[string]ModelConfig{
 		OpenAIID:    "gpt-6-sol",
 		DisplayName: "GPT-6 Sol",
 	},
+	"gpt6-astra": {
+		Tone:        "GPT_6_Astra",
+		OpenAIID:    "gpt-6-astra",
+		DisplayName: "GPT-6 Astra",
+	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
 		Tone:        "Claude_Sonnet",

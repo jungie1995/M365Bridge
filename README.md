@@ -778,6 +778,7 @@ Model selection travels in the `tone` field the M365 backend reads. GPT and Clau
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes      | GPT-5   |
 | `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | No | GPT selector |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | No | GPT selector |
+| `gpt6-astra`               | GPT_6_Astra | gpt-6-astra | No | GPT selector |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
@@ -795,12 +796,15 @@ The new GPT selectors follow [upstream's October 3, 2026 tone probes](https://gi
 | GPT-5.6 reasoning selector                | `gpt5.6-reasoning` |
 | Plain chat on a recent model              | `gpt5.6`           |
 | GPT-6 Sol selector                        | `gpt6sol`          |
+| GPT-6 Astra selector                      | `gpt6-astra`       |
 | Claude Sonnet 4.6                         | `claude-sonnet`    |
 | Claude Opus 4.6, the most capable         | `claude-opus`      |
 
 A reasoning model produces thinking content alongside its answer. OpenAI endpoints expose it as `reasoning_content`, and Anthropic endpoints as a `thinking` block before the `text` block. `claude-opus` produces it as well; `claude-sonnet` does not. `gpt5.6-reasoning` advertises the capability but has not been observed emitting it. Every advertised capability comes from measured behaviour rather than from the name of the tone.
 
 ### Model names this gateway does not serve
+
+GPT-6 Astra (`gpt-6-astra`, key `gpt6-astra`) follows upstream's `GPT_6_Astra` routing tone and passed an isolated live response check before installation. The catalog does not advertise thinking or a separate reasoning-effort route for this selector. Microsoft controls account availability and the model behind each tone.
 
 A model name outside the registry is answered with `404 model_not_found`, never with a different entry, so a caller is never answered by a tone it did not ask for.
 
@@ -1558,6 +1562,10 @@ web/                       # Vite project for the interface; make ui builds it i
 docs/                      # Screenshots used by the READMEs
 data/                      # Runtime data, gitignored: tokens/, setup.json, cache/, transcripts/
 ```
+
+## GitHub storage cleanup
+
+The `Cleanup Artifacts and Caches` workflow runs daily at 04:07 UTC. It deletes expired Actions artifacts and artifacts older than seven days, plus caches associated with deleted branches or closed pull requests. It retains caches for active branches, open pull requests, tags, and unrecognized refs. This concerns GitHub Actions storage; it does not delete local bridge data or release assets. A manual run can override artifact retention with `max_age_days`; an explicit `0` deletes all Actions artifacts. An empty input uses the seven-day default.
 
 ## Dependencies
 

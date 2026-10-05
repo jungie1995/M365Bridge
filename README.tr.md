@@ -734,6 +734,7 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT ve Cl
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Evet     | GPT-5   |
 | `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | Hayır | GPT selector |
 | `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | Hayır | GPT selector |
+| `gpt6-astra`               | GPT_6_Astra | gpt-6-astra | Hayır | GPT selector |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |
@@ -751,12 +752,15 @@ Yeni GPT seçicileri, [upstream'in 3 Ekim 2026 tone testlerinden](https://github
 | GPT-5.6 reasoning seçicisi                  | `gpt5.6-reasoning` |
 | Güncel bir modelde düz sohbet              | `gpt5.6`           |
 | GPT-6 Sol seçicisi                         | `gpt6sol`          |
+| GPT-6 Astra seçicisi                       | `gpt6-astra`       |
 | Claude Sonnet 4.6                          | `claude-sonnet`    |
 | Claude Opus 4.6, en yetenekli olan         | `claude-opus`      |
 
 Bir reasoning modeli, cevabının yanında düşünce içeriği de üretir. OpenAI endpoint'leri bunu `reasoning_content` olarak, Anthropic endpoint'leri ise `text` bloğundan önce gelen bir `thinking` bloğu olarak sunar. `claude-opus` da üretir, `claude-sonnet` üretmez. `gpt5.6-reasoning` bu yeteneği ilan eder ama ürettiği gözlenmemiştir. İlan edilen her yetenek, tone'un adından değil ölçülen davranışından gelir.
 
 ### Bu gateway'in sunmadığı model adları
+
+GPT-6 Astra (`gpt-6-astra`, key `gpt6-astra`), upstream'in `GPT_6_Astra` yönlendirme tone'unu kullanır ve kurulumdan önce ayrı bir süreçte canlı yanıt testi geçmiştir. Katalog bu seçici için thinking veya ayrı bir reasoning-effort yönlendirmesi ilan etmez. Hesap erişimini ve her tone'un arkasındaki modeli Microsoft belirler.
 
 Registry dışında kalan bir model adı `404 model_not_found` ile yanıtlanır, başka bir kayda düşülmez. Böylece çağıran taraf istemediği bir tone'dan cevap almaz.
 
@@ -1340,6 +1344,10 @@ web/                       # Arayüzün Vite projesi; make ui bunu pkg/webui/dis
 docs/                      # README'lerde kullanılan ekran görüntüleri
 data/                      # Runtime verisi, gitignore kapsamında: tokens/, setup.json, cache/, transcripts/
 ```
+
+## GitHub depolama temizliği
+
+`Cleanup Artifacts and Caches` workflow'u her gün 04:07 UTC'de çalışır. Süresi dolmuş Actions artifact'lerini ve yedi günden eski artifact'leri, ayrıca silinmiş branch veya kapanmış pull request'lere ait cache'leri siler. Aktif branch'lerin, açık pull request'lerin, tag'lerin ve tanınmayan ref'lerin cache'leri korunur. Bu işlem yalnızca GitHub Actions depolamasını etkiler; yerel bridge verilerini veya release dosyalarını silmez. Manuel çalıştırmada `max_age_days` değiştirilebilir; açıkça `0` girilmesi tüm Actions artifact'lerini siler. Boş değer yedi günlük varsayılanı kullanır.
 
 ## Bağımlılıklar
 

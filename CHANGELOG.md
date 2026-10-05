@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Add the GPT-6 Astra selector (`gpt-6-astra`) after an isolated live response check, preserving the fork's existing model defaults and custom transport behavior.
+- Import upstream's daily GitHub Actions artifact/cache cleanup workflow with seven-day artifact retention. Verify its deletion rules against simulated API responses in CI.
 - Add GPT-5.6 Sol Quick response (`gpt-5.6`) and GPT-6 Sol (`gpt-6-sol`) using upstream 1.5.2 routing tones. Label the existing `gpt-5.6-reasoning` entry GPT-5.6 Sol Think deeper to match the Microsoft 365 picker. Preserve existing model IDs and defaults. Account availability and underlying model identity are not guaranteed by the catalog.
 
 ## [1.5.0] - 2026-09-04

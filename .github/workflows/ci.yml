@@ -88,6 +88,9 @@ jobs:
       - name: Validate network fault injector
         run: python tests/fault_proxy_test.py
 
+      - name: Validate storage cleanup rules
+        run: node --test tests/cleanup_workflow.test.cjs
+
       # -race needs cgo, which is available on the ubuntu runner. Concurrency
       # regressions in the token refresh path only surface under the detector.
       - name: Test
