@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Added
+- Add GPT-5.6 Sol Quick response (`gpt-5.6`) and GPT-6 Sol (`gpt-6-sol`) using upstream 1.5.2 routing tones. Label the existing `gpt-5.6-reasoning` entry GPT-5.6 Sol Think deeper to match the Microsoft 365 picker. Preserve existing model IDs and defaults. Account availability and underlying model identity are not guaranteed by the catalog.
+
 ## [1.5.0] - 2026-09-04
 
 ### Added

@@ -761,7 +761,7 @@ Once a stream has opened the status is already sent, so the same classification 
 
 ## Models
 
-Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys route to the GPT-5 backend. Claude tones return Claude answers, though M365 does not expose the underlying model identity in its SignalR metadata.
+Model selection travels in the `tone` field the M365 backend reads. GPT and Claude keys select Microsoft 365 routing tones; M365 does not expose the underlying model identity in its SignalR metadata.
 
 | Key                        | Tone              | OpenAI ID         | Thinking | Backend |
 |----------------------------|-------------------|-------------------|----------|---------|
@@ -776,6 +776,8 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | No       | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes      | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes      | GPT-5   |
+| `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | No | GPT selector |
+| `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | No | GPT selector |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No       | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Yes      | Claude  |
@@ -783,13 +785,16 @@ Model selection travels in the `tone` field the M365 backend reads. GPT-5.x keys
 
 ### Which one to use
 
+The new GPT selectors follow [upstream's October 3, 2026 tone probes](https://github.com/KilimcininKorOglu/M365Bridge/blob/ed900c703f71bae737864f8e1db0e0dd148c4bce/CHANGELOG.md#152---2026-10-03). A successful probe confirms that a tone completed a turn on the tested account, not the identity of the underlying model or availability on every account. The Microsoft 365 picker labels appear as `display_name`: **GPT-6 Sol** (`gpt-6-sol`), **GPT-5.6 Sol Think deeper** (`gpt-5.6-reasoning`), and **GPT-5.6 Sol Quick response** (`gpt-5.6`). GPT-6 Sol has not been observed emitting thinking content. The default remains `gpt5.5-reasoning` for existing clients.
+
 | What you want                             | Model              |
 |-------------------------------------------|--------------------|
 | General purpose, let the backend decide   | `auto`             |
 | Fast answers to simple questions          | `quick`            |
 | Complex reasoning, multi-step problems    | `gpt5.5-reasoning` |
-| The newest reasoning model                | `gpt5.6-reasoning` |
-| Plain chat on a recent model              | `gpt5.5`           |
+| GPT-5.6 reasoning selector                | `gpt5.6-reasoning` |
+| Plain chat on a recent model              | `gpt5.6`           |
+| GPT-6 Sol selector                        | `gpt6sol`          |
 | Claude Sonnet 4.6                         | `claude-sonnet`    |
 | Claude Opus 4.6, the most capable         | `claude-opus`      |
 

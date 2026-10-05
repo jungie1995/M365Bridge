@@ -717,7 +717,7 @@ Bir stream açıldıktan sonra durum kodu çoktan gönderilmiştir, bu yüzden a
 
 ## Modeller
 
-Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x key'leri GPT-5 backend'ine gider. Claude tone'ları Claude cevabı döndürür, ancak M365 SignalR metadata'sında altta çalışan modelin kimliğini açıklamaz.
+Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT ve Claude key'leri Microsoft 365 yönlendirme tone'larını seçer; M365 SignalR metadata'sında altta çalışan modelin kimliğini açıklamaz.
 
 | Key                        | Tone              | OpenAI ID         | Thinking | Backend |
 |----------------------------|-------------------|-------------------|----------|---------|
@@ -732,6 +732,8 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | Hayır    | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Evet     | GPT-5   |
 | `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Evet     | GPT-5   |
+| `gpt5.6`                   | Gpt_5_6_Chat | gpt-5.6 | Hayır | GPT selector |
+| `gpt6sol`                  | Gpt_6_Sol_Reasoning | gpt-6-sol | Hayır | GPT selector |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Evet     | Claude  |
@@ -739,13 +741,16 @@ Model seçimi, M365 backend'inin okuduğu `tone` alanında taşınır. GPT-5.x k
 
 ### Hangisini kullanmalı
 
+Yeni GPT seçicileri, [upstream'in 3 Ekim 2026 tone testlerinden](https://github.com/KilimcininKorOglu/M365Bridge/blob/ed900c703f71bae737864f8e1db0e0dd148c4bce/CHANGELOG.md#152---2026-10-03) alınmıştır. Başarılı bir test, tone'un test edilen hesapta yanıt verdiğini gösterir; alttaki modelin kimliğini veya her hesapta kullanılabilirliğini doğrulamaz. Microsoft 365 seçicisinin etiketleri `display_name` alanında sunulur: **GPT-6 Sol** (`gpt-6-sol`), **GPT-5.6 Sol Think deeper** (`gpt-5.6-reasoning`) ve **GPT-5.6 Sol Quick response** (`gpt-5.6`). GPT-6 Sol'da thinking içeriği gözlenmemiştir. Mevcut istemciler için varsayılan `gpt5.5-reasoning` olarak kalır.
+
 | İhtiyacınız                                | Model              |
 |--------------------------------------------|--------------------|
 | Genel kullanım, seçimi backend yapsın      | `auto`             |
 | Basit sorulara hızlı cevap                 | `quick`            |
 | Karmaşık akıl yürütme, çok adımlı problem  | `gpt5.5-reasoning` |
-| En yeni reasoning modeli                   | `gpt5.6-reasoning` |
-| Güncel bir modelde düz sohbet              | `gpt5.5`           |
+| GPT-5.6 reasoning seçicisi                  | `gpt5.6-reasoning` |
+| Güncel bir modelde düz sohbet              | `gpt5.6`           |
+| GPT-6 Sol seçicisi                         | `gpt6sol`          |
 | Claude Sonnet 4.6                          | `claude-sonnet`    |
 | Claude Opus 4.6, en yetenekli olan         | `claude-opus`      |
 

@@ -172,8 +172,23 @@ var ModelRegistry = map[string]ModelConfig{
 		Tone:        "Gpt_5_6_Reasoning",
 		Override:    "",
 		OpenAIID:    "gpt-5.6-reasoning",
-		DisplayName: "GPT-5.6 Reasoning",
+		DisplayName: "GPT-5.6 Sol Think deeper",
 		Thinking:    true,
+	},
+	"gpt5.6": {
+		Tone:        "Gpt_5_6_Chat",
+		OpenAIID:    "gpt-5.6",
+		DisplayName: "GPT-5.6 Sol Quick response",
+	},
+	// These GPT selectors follow upstream's 2026-10-03 live tone probes and
+	// the Microsoft 365 model picker labels reported by the operator.
+	// Completing a turn does not attest the underlying model identity. The
+	// Sol reasoning tone emitted no thinking content in the measured turn,
+	// so its reasoning selectors do not advertise thinking support.
+	"gpt6sol": {
+		Tone:        "Gpt_6_Sol_Reasoning",
+		OpenAIID:    "gpt-6-sol",
+		DisplayName: "GPT-6 Sol",
 	},
 	// Claude — real Anthropic models (verified via tone test, July 2026)
 	"claude": {
