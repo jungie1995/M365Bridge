@@ -100,6 +100,7 @@ USAGE
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
   m365-bridge login [flags]             Connect Microsoft through the local browser
   m365-bridge login-browser [flags]     Reconnect using a dedicated Edge sign-in window
+  m365-bridge login [flags]             Sign in with zero-browser Device Code or PKCE flow
   m365-bridge --help                    Print this text
 
   Every flag is optional. With none, serve listens on port %d and setup-wizard
@@ -128,6 +129,9 @@ LOGIN FLAGS
                     installed Chrome automatically)
   -cookies <path>   JSON cookie file to seed the browser with, for an
                     unattended sign-in
+  (default)         Sign in with zero-browser Device Code Flow (RFC 8628)
+  -pkce             Sign in via terminal-assisted PKCE flow
+  -quiet            Suppress banner and non-essential output
 
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
@@ -299,16 +303,19 @@ func runBrowserLogin(args []string) {
 	fmt.Println("Microsoft account connected. Credentials were saved locally; no browser export is required.")
 }
 
-// runLogin captures the standard, broker, and browser credentials in one
-// interactive login. login-browser remains available for reconnecting an
-// existing Edge session used by image/web-session features.
+// runLogin performs zero-browser sign-in using Device Code or PKCE flow.
 func runLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	fs.Usage = func() { printUsage(os.Stdout) }
-	browser := fs.String("browser", "", "Browser executable to drive; empty discovers the installed Chrome")
-	cookies := fs.String("cookies", "", "JSON cookie file to seed the browser with, for an unattended sign-in")
+	pkce := fs.Bool("pkce", false, "Use terminal-assisted PKCE sign-in flow")
+	quiet := fs.Bool("quiet", false, "Suppress banner and non-essential output")
 	_ = fs.Parse(args)
-	if err := setup.RunLogin(setup.LoginOptions{BrowserPath: *browser, CookiesFile: *cookies}); err != nil {
+
+	opts := setup.LoginOptions{
+		Quiet: *quiet,
+		PKCE:  *pkce,
+	}
+	if err := setup.RunLogin(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

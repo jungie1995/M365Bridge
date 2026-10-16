@@ -17,11 +17,32 @@ import (
 var Version = "1.5.0"
 
 const (
-	// DefaultClientID is the default Microsoft 365 Copilot client ID.
-	DefaultClientID = "4765445b-32c6-49b0-83e6-1d93765276ca"
+	// DefaultClientID is the default Microsoft 365 Copilot client ID for PKCE and web flows.
+	// Uses the first-party native/public client ID which receives a 90-day rolling
+	// refresh token, completely eliminating the 24-hour SPA expiration wall.
+	DefaultClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
+
+	// DefaultDeviceClientID is the Microsoft Office native client ID used for Device Code flow (RFC 8628).
+	// This client is registered as a public client and allows device authorization grant without a client secret.
+	DefaultDeviceClientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+
+	// LegacySPAClientID is the older web-only SPA client ID (24-hour expiration).
+	LegacySPAClientID = "4765445b-32c6-49b0-83e6-1d93765276ca"
+
+	// FOCIClientID is the Microsoft Office native client ID (alternative/FOCI).
+	FOCIClientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+
+	// NativeRedirectURI is the official OAuth2 redirect URI registered for public/native clients.
+	NativeRedirectURI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 
 	// DefaultScope is the OAuth2 scope for M365 Copilot access.
 	DefaultScope = "https://substrate.office.com/sydney/.default openid profile offline_access"
+
+	// DesignerScope is the OAuth2 scope for downloading generated images directly.
+	DesignerScope = "https://designerappservice.officeapps.live.com/.default"
+
+	// M365CloudScope is the OAuth2 scope for conversation management via M365 Cloud.
+	M365CloudScope = "https://m365.cloud.microsoft/v2/.default"
 )
 
 // ModelConfig represents the configuration for a specific model variant.
@@ -369,7 +390,7 @@ func LoadConfig() *Config {
 	cfg := &Config{
 		TenantID:              os.Getenv("M365_TENANT_ID"),
 		UserOID:               os.Getenv("M365_USER_OID"),
-		ClientID:              getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
+		ClientID:              resolveClientID(),
 		Scope:                 DefaultScope,
 		APIKeys:               parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
 		EnableCodeTools:       getEnvBool("M365_ENABLE_CODE_TOOLS", false),
@@ -568,4 +589,12 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return parsed
+}
+
+func resolveClientID() string {
+	cid := strings.TrimSpace(os.Getenv("M365_CLIENT_ID"))
+	if cid == "" || cid == LegacySPAClientID {
+		return DefaultClientID
+	}
+	return cid
 }
