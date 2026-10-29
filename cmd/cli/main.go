@@ -65,6 +65,11 @@ func main() {
 		case "login-browser":
 			runBrowserLogin(os.Args[2:])
 			return
+		case "login":
+			// Codex-style spelling for the same local browser reconnect flow.
+			// Keep login-browser as an explicit compatibility command.
+			runBrowserLogin(os.Args[2:])
+			return
 		}
 	}
 
@@ -95,6 +100,7 @@ USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
+  m365-bridge login [flags]             Connect Microsoft through the local browser
   m365-bridge login-browser [flags]     Reconnect using a dedicated Edge sign-in window
   m365-bridge --help                    Print this text
 
