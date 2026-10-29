@@ -169,6 +169,17 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// This client supports both native and browser redirect flows. The browser
+	// login can issue an SPA refresh token even though the same client also
+	// supports native tokens. Retry only Microsoft's explicit SPA-origin error;
+	// adding Origin to every native token request would cause AADSTS9002326.
+	if status == http.StatusBadRequest && tm.clientID == models.DefaultClientID && aadstsCode(string(body)) == "AADSTS9002327" {
+		logging.Info("TokenManager.Refresh: browser-issued token requires the registered web origin")
+		body, status, err = tm.redeemRefreshTokenWithOrigin(refreshToken, true)
+		if err != nil {
+			return "", err
+		}
+	}
 	if status != http.StatusOK {
 		return tm.handleRefreshFailure(status, body)
 	}
@@ -184,6 +195,10 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 // redeemRefreshToken posts the refresh_token grant and returns the bounded
 // response body with its status, so the caller decides what the status means.
 func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, error) {
+	return tm.redeemRefreshTokenWithOrigin(refreshToken, tm.clientID == models.LegacySPAClientID)
+}
+
+func (tm *TokenManager) redeemRefreshTokenWithOrigin(refreshToken string, browserOrigin bool) ([]byte, int, error) {
 	data := url.Values{}
 	data.Set("client_id", tm.clientID)
 	data.Set("refresh_token", refreshToken)
@@ -196,7 +211,7 @@ func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, er
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if tm.clientID == models.LegacySPAClientID {
+	if browserOrigin {
 		req.Header.Set("Origin", "https://m365.cloud.microsoft")
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
