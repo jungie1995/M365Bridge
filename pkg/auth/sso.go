@@ -605,6 +605,9 @@ const designerBrokerRedirectURI = "brk-multihub://outlook.office.com"
 // exchange as the broker grant by this value.
 const BrokerClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
 
+// brokerClientID is retained for the browser Designer compatibility checks.
+const brokerClientID = BrokerClientID
+
 // designerTokenCache is the on-disk cache for the designerapp access token.
 type designerTokenCache struct {
 	AccessToken string `json:"access_token"`

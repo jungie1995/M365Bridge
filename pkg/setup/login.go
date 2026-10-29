@@ -26,6 +26,18 @@ type LoginOptions struct {
 	PKCE  bool
 }
 
+func saveEnvTo(tenant, oid, clientID, envFile string) error {
+	if clientID == "" {
+		clientID = models.DefaultClientID
+	}
+	envContent := fmt.Sprintf("# M365 Copilot Configuration\nM365_TENANT_ID=%s\nM365_USER_OID=%s\nM365_CLIENT_ID=%s\n", tenant, oid, clientID)
+	if err := atomicfile.Write(envFile, []byte(envContent), 0600); err != nil {
+		return fmt.Errorf("failed to save environment file: %w", err)
+	}
+	fmt.Printf("  Environment variables saved to %s\n", envFile)
+	return nil
+}
+
 // RunLogin initiates zero-browser authentication using either Device Code Flow
 // (default, RFC 8628) or terminal-assisted PKCE.
 func RunLogin(opts LoginOptions) error {
