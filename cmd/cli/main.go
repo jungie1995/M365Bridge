@@ -98,7 +98,6 @@ USAGE
   m365-bridge [flags] ["question"]      Ask one question, or start interactive mode
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
-  m365-bridge login [flags]             Connect Microsoft through the local browser
   m365-bridge login-browser [flags]     Reconnect using a dedicated Edge sign-in window
   m365-bridge login [flags]             Sign in with zero-browser Device Code or PKCE flow
   m365-bridge --help                    Print this text
@@ -125,10 +124,6 @@ BROWSER SIGN-IN FLAGS
   -timeout <duration>   Sign-in window timeout (default 5m, maximum 10m)
   -status-file <path>   Non-secret progress file (default data/browser-login-status.json)
 LOGIN FLAGS
-  -browser <path>   Browser executable to drive (default: discover the
-                    installed Chrome automatically)
-  -cookies <path>   JSON cookie file to seed the browser with, for an
-                    unattended sign-in
   (default)         Sign in with zero-browser Device Code Flow (RFC 8628)
   -pkce             Sign in via terminal-assisted PKCE flow
   -quiet            Suppress banner and non-essential output
