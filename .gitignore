@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 m365-bridge
+*.exe
 
 # Web interface sources. The build output is committed at pkg/webui/dist,
 # because go:embed reads it at compile time; web/dist is only the staging copy.
