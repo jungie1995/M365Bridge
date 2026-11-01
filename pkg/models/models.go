@@ -449,20 +449,9 @@ func loadDotEnv() {
 	}
 
 	for line := range strings.SplitSeq(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		key, value, ok := parseDotEnvLine(line)
+		if !ok {
 			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
-			value = value[1 : len(value)-1]
 		}
 
 		// Only set if not already in environment (env vars take precedence)
@@ -470,6 +459,22 @@ func loadDotEnv() {
 			_ = os.Setenv(key, value)
 		}
 	}
+}
+
+func parseDotEnvLine(line string) (key, value string, ok bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	key, value, ok = strings.Cut(line, "=")
+	if !ok {
+		return "", "", false
+	}
+	key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+	if len(value) >= 2 && ((value[0] == '\'' && value[len(value)-1] == '\'') || (value[0] == '"' && value[len(value)-1] == '"')) {
+		value = value[1 : len(value)-1]
+	}
+	return key, value, true
 }
 
 // RegistryKeysFor reports every registry key a request may reach by name: the

@@ -112,7 +112,7 @@ func browserIdentity(token string) (string, string, error) {
 			return claims.Tenant, claims.OID, nil
 		}
 	}
-	return "", "", errors.New("Microsoft did not return a valid work or school account identity for this bridge")
+	return "", "", errors.New("the Microsoft response did not contain a valid work or school account identity for this bridge")
 }
 
 func (tm *TokenManager) completeBrowserLogin(ctx context.Context, challenge *BrowserChallenge, callback string, loginCookies, webCookies []SSOCookie, persistIdentity func(string, string) error) error {
