@@ -18,6 +18,8 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/textcut"
 )
 
 var (
@@ -167,6 +169,17 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// This client supports both native and browser redirect flows. The browser
+	// login can issue an SPA refresh token even though the same client also
+	// supports native tokens. Retry only Microsoft's explicit SPA-origin error;
+	// adding Origin to every native token request would cause AADSTS9002326.
+	if status == http.StatusBadRequest && tm.clientID == models.DefaultClientID && aadstsCode(string(body)) == "AADSTS9002327" {
+		logging.Info("TokenManager.Refresh: browser-issued token requires the registered web origin")
+		body, status, err = tm.redeemRefreshTokenWithOrigin(refreshToken, true)
+		if err != nil {
+			return "", err
+		}
+	}
 	if status != http.StatusOK {
 		return tm.handleRefreshFailure(status, body)
 	}
@@ -182,6 +195,10 @@ func (tm *TokenManager) refreshLocked() (string, error) {
 // redeemRefreshToken posts the refresh_token grant and returns the bounded
 // response body with its status, so the caller decides what the status means.
 func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, error) {
+	return tm.redeemRefreshTokenWithOrigin(refreshToken, tm.clientID == models.LegacySPAClientID)
+}
+
+func (tm *TokenManager) redeemRefreshTokenWithOrigin(refreshToken string, browserOrigin bool) ([]byte, int, error) {
 	data := url.Values{}
 	data.Set("client_id", tm.clientID)
 	data.Set("refresh_token", refreshToken)
@@ -194,7 +211,9 @@ func (tm *TokenManager) redeemRefreshToken(refreshToken string) ([]byte, int, er
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	if browserOrigin {
+		req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
 	client := &http.Client{}
@@ -260,6 +279,69 @@ func (tm *TokenManager) storeRefreshResult(result refreshResponse) (string, erro
 
 	logging.Infof("TokenManager.Refresh: success, expires_in=%d expires_at=%s", result.ExpiresIn, expiresAt.Format(time.RFC3339))
 	return result.AccessToken, nil
+}
+
+// RefreshWithScope exchanges the stored refresh token for an access token scoped
+// to a specific resource (such as Designer or M365 Cloud), rotating and saving
+// the refresh token on success.
+func (tm *TokenManager) RefreshWithScope(scope string) (string, error) {
+	tm.refreshMu.Lock()
+	defer tm.refreshMu.Unlock()
+
+	refreshToken, err := tm.readRefreshToken()
+	if err != nil {
+		return "", err
+	}
+
+	body, err := tm.executeScopeRefresh(refreshToken, scope)
+	if err != nil {
+		return "", err
+	}
+
+	var result refreshResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("%w: failed to parse scope refresh response: %v", ErrRefreshFailed, err)
+	}
+
+	if result.RefreshToken != "" {
+		if err := tm.writeRefreshToken(result.RefreshToken); err != nil {
+			logging.Warnf("TokenManager.RefreshWithScope: failed to save rotated refresh token: %v", err)
+		}
+	}
+
+	return result.AccessToken, nil
+}
+
+func (tm *TokenManager) executeScopeRefresh(refreshToken, scope string) ([]byte, error) {
+	data := url.Values{
+		"client_id":     {tm.clientID},
+		"refresh_token": {refreshToken},
+		"grant_type":    {"refresh_token"},
+		"scope":         {scope},
+	}
+
+	req, err := http.NewRequest("POST", tm.tokenURL, bytes.NewBufferString(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to create scope request: %v", ErrRefreshFailed, err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: scope refresh request failed: %v", ErrRefreshFailed, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, tokenResponseMax+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to read scope response: %v", ErrRefreshFailed, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: scope refresh status %d: %s", ErrRefreshFailed, resp.StatusCode, textcut.Truncate(string(body), 200))
+	}
+	return body, nil
 }
 
 // readRefreshToken reads and decrypts the refresh token from file.

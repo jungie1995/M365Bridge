@@ -47,6 +47,8 @@ foreach ($pair in @(
     @('scripts\start-bridge.ps1','scripts\start-bridge.ps1'),
     @('scripts\connect-microsoft.ps1','scripts\connect-microsoft.ps1'),
     @('connect-microsoft.cmd','connect-microsoft.cmd'),
+    @('login.cmd','login.cmd'),
+    @('login-browser.cmd','login-browser.cmd'),
     @('start-bridges.cmd','start-bridges.cmd')
 )) {
     $sourceFile = [IO.Path]::GetFullPath((Join-Path $SourceRoot $pair[0]))

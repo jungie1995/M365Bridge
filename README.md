@@ -8,6 +8,10 @@
 
 **English** | **[Türkçe](README.tr.md)**
 
+**Start here: [Setup and Microsoft sign-in](README-SETUP.md)** covers device-code
+login, browser sign-in, reconnecting existing API clients, and choosing the right
+account folder.
+
 M365Bridge turns a Microsoft 365 Copilot subscription into an OpenAI-compatible and Anthropic-compatible HTTP API. Point any client that speaks either protocol at this service and it works: Claude Code, Codex, Cursor, Cline, the OpenAI and Anthropic SDKs, or your own code.
 
 This is the **jungie1995 fork**, based on [KilimcininKorOglu/M365Bridge](https://github.com/KilimcininKorOglu/M365Bridge), with task-queue continuity, progress-aware tool loops, dedicated Windows browser reconnect and browser-compatible image routing. Install from this repository to include those changes. The Go module/import path remains the upstream path for compatibility.
@@ -25,7 +29,7 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 ## Requirements
 
 - A **Microsoft 365 Copilot license**. A business or enterprise account with Copilot access. A Copilot Chat (basic) account has also been tested.
-- **Microsoft Edge on Windows** for the guided first-time browser sign-in and reconnect. No account-ID/token copying or browser-console export is needed for that flow. Docker/manual setup is documented separately below.
+- **Microsoft Edge on Windows** for guided browser sign-in, Designer image authorization and browser reconnect. Device-code and terminal-assisted PKCE text login are also available; see the [setup guide](README-SETUP.md). No account-ID/token copying or browser-console export is needed for the guided flow. Docker/manual setup is documented separately below.
 - **Docker**, or **Go 1.26.6+** if you build from source. Go 1.21 and newer also work, because they download the 1.26.6 toolchain on the first build, unless `GOTOOLCHAIN` is set to `local`. The patch level is part of the requirement: every release before 1.26.6 carries standard-library vulnerabilities this service reaches through its own HTTP and TLS paths.
 
 ## Features
@@ -52,6 +56,11 @@ Copilot has no public API. It talks to its own web client over a SignalR WebSock
 Build this fork from source, either with the Windows installer below or Docker. These paths include both upstream improvements and our custom fixes. Microsoft account setup is a separate first-time step; upgrades preserve the existing `data/` directory.
 
 ### Windows: fresh installation and upgrades
+
+For device-code login or an installation you want to sign into later, follow the
+[setup guide](README-SETUP.md#device-code-login). Native login preserves existing
+gateway keys and operator settings; text sign-in and Designer authorization are
+checked separately.
 
 Recommended: clone this repository and double-click **setup-bridge.cmd**. It installs missing Git/Go dependencies with Windows Package Manager, builds this fork, installs it into `%LOCALAPPDATA%\M365Bridge`, and opens a dedicated Edge sign-in window. Sign in to your Microsoft work/school account and complete MFA. Both local services start after successful login.
 

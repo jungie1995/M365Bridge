@@ -21,6 +21,9 @@ $settings = [IO.File]::ReadAllText($settingsPath)
 if ($settings -notmatch '(?m)^M365_API_KEY=[0-9a-f]{64}\r?$' -or $settings -notmatch 'M365_MAX_TOOL_ROUNDS=128') { throw 'Fresh installation defaults were not initialized.' }
 if (-not (Test-Path -LiteralPath (Join-Path $install 'scripts\start-bridge.ps1'))) { throw 'Starter was not installed.' }
 if (-not (Test-Path -LiteralPath (Join-Path $install 'connect-microsoft.cmd'))) { throw 'Reconnect shortcut was not installed.' }
+foreach ($launcher in @('login.cmd','login-browser.cmd')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $install $launcher))) { throw "Login launcher was not installed: $launcher" }
+}
 $tokenDir = Join-Path $install 'data\tokens'
 New-Item -ItemType Directory -Path $tokenDir | Out-Null
 [IO.File]::WriteAllText((Join-Path $tokenDir 'token_cache.json'),'{"fixture":true}')

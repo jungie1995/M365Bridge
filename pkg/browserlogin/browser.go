@@ -240,7 +240,12 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	if firstLogin {
 		tenant = "organizations"
 	}
-	tm := auth.NewTokenManager(tenant, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
+	// The browser SSO flow uses the Copilot web application's client. A
+	// device-code login may leave M365_CLIENT_ID set to the Office native client
+	// (d3590ed6...), whose redirect URI is not registered for /spalanding.
+	// Always pair this browser redirect with the web client.
+	browserClientID := models.DefaultClientID
+	tm := auth.NewTokenManager(tenant, browserClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
 	tm.SetUserOID(config.UserOID)
 	challenge, err := tm.BeginBrowserLogin()
 	if err != nil {
@@ -273,13 +278,19 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 		})
 	} else {
 		err = tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal)
+		if err == nil {
+			// Keep subsequent server refreshes on the same client that issued the
+			// browser token instead of leaving the device-code client in .env.
+			config.ClientID = browserClientID
+			err = setup.SaveBrowserIdentity(config.TenantID, config.UserOID)
+		}
 	}
 	if err != nil {
 		return err
 	}
 	// A first sign-in discovers the identity. Use that verified identity for the
 	// separate Designer exchange, never the temporary organizations tenant.
-	designer := auth.NewTokenManager(config.TenantID, config.ClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
+	designer := auth.NewTokenManager(config.TenantID, browserClientID, config.Scope, "data/tokens/rt_90day.txt", "data/tokens/token_cache.json")
 	designer.SetUserOID(config.UserOID)
 	if err := b.completeDesigner(ctx, options, designer, config.TenantID); err != nil {
 		return err

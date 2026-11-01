@@ -65,6 +65,9 @@ func main() {
 		case "login-browser":
 			runBrowserLogin(os.Args[2:])
 			return
+		case "login":
+			runLogin(os.Args[2:])
+			return
 		}
 	}
 
@@ -96,6 +99,7 @@ USAGE
   m365-bridge serve [flags]             Run the HTTP API server and web interface
   m365-bridge setup-wizard [flags]      Import credentials from a browser export
   m365-bridge login-browser [flags]     Reconnect using a dedicated Edge sign-in window
+  m365-bridge login [flags]             Sign in with zero-browser Device Code or PKCE flow
   m365-bridge --help                    Print this text
 
   Every flag is optional. With none, serve listens on port %d and setup-wizard
@@ -119,6 +123,10 @@ SETUP-WIZARD FLAGS
 BROWSER SIGN-IN FLAGS
   -timeout <duration>   Sign-in window timeout (default 5m, maximum 10m)
   -status-file <path>   Non-secret progress file (default data/browser-login-status.json)
+LOGIN FLAGS
+  (default)         Sign in with zero-browser Device Code Flow (RFC 8628)
+  -pkce             Sign in via terminal-assisted PKCE flow
+  -quiet            Suppress banner and non-essential output
 
 `, models.Version, defaultPort, defaultSetupFile, defaultModel, defaultPort, defaultSetupFile)
 
@@ -288,6 +296,24 @@ func runBrowserLogin(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("Microsoft account connected. Credentials were saved locally; no browser export is required.")
+}
+
+// runLogin performs zero-browser sign-in using Device Code or PKCE flow.
+func runLogin(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	fs.Usage = func() { printUsage(os.Stdout) }
+	pkce := fs.Bool("pkce", false, "Use terminal-assisted PKCE sign-in flow")
+	quiet := fs.Bool("quiet", false, "Suppress banner and non-essential output")
+	_ = fs.Parse(args)
+
+	opts := setup.LoginOptions{
+		Quiet: *quiet,
+		PKCE:  *pkce,
+	}
+	if err := setup.RunLogin(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runCLI runs the default CLI mode (single query or interactive).
