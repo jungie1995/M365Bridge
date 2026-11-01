@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserve existing gateway keys, passwords and operator settings during device-code and native PKCE login, while updating the verified account and OAuth client identity.
+- Keep installed browser reconnect on the managed dual-service launcher and ship the standalone device-code/browser login shortcuts with Windows installations.
+
+### Documentation
+- Add `README-SETUP.md` with first installation, login-method selection, device-code/PKCE steps, browser and Designer reconnect, account-folder selection and connection troubleshooting. Token renewal is described without a guaranteed session lifetime.
+
 ### Added
 - Enable the live-tested Fable, Grok 4.5/Auto/Reasoning, Muse Spark, and Sonnet Think deeper selectors. Mark their display names experimental and their ownership Microsoft 365 because underlying vendor/model identities remain unverified; preserve existing Claude model entries and defaults.
 - Add the GPT-6 Astra selector (`gpt-6-astra`) after an isolated live response check, preserving the fork's existing model defaults and custom transport behavior.

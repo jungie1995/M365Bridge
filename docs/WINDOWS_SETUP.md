@@ -1,5 +1,9 @@
 # Windows: browser sign-in and Content Studio setup
 
+For device-code login, terminal-assisted PKCE, source-versus-install account
+folders, and the basic reconnect steps, start with [Setup and Microsoft sign-in](../README-SETUP.md).
+This page covers the Windows browser/Designer flow in detail.
+
 ## Easiest installation
 
 An extracted GitHub source ZIP also works with setup-bridge.cmd. Without Git metadata the install manifest reports `source-archive` rather than inventing a commit ID; download updated source to upgrade that copy.

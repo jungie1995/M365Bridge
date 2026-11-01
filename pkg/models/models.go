@@ -18,8 +18,8 @@ var Version = "1.5.0"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID for PKCE and web flows.
-	// Uses the first-party native/public client ID which receives a 90-day rolling
-	// refresh token, completely eliminating the 24-hour SPA expiration wall.
+	// Native/public-client refresh tokens are not subject to the SPA-specific
+	// 24-hour lifetime. Microsoft policy still controls renewal and revocation.
 	DefaultClientID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
 
 	// DefaultDeviceClientID is the Microsoft Office native client ID used for Device Code flow (RFC 8628).

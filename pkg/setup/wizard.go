@@ -520,7 +520,7 @@ func saveEnv(tenant, oid string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to read existing environment file: %w", err)
 	}
-	envContent := mergeIdentityEnv(string(existing), tenant, oid)
+	envContent := mergeIdentityEnv(string(existing), tenant, oid, models.DefaultClientID)
 
 	if err := atomicfile.Write(defaultEnvFile, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("failed to save environment file: %w", err)
@@ -532,9 +532,9 @@ func saveEnv(tenant, oid string) error {
 
 // Account setup updates identity only. Operator settings, especially the API
 // key and tool-round limit, must survive initial setup and later reimports.
-func mergeIdentityEnv(original, tenant, oid string) string {
+func mergeIdentityEnv(original, tenant, oid, clientID string) string {
 	keys := []string{"M365_TENANT_ID", "M365_USER_OID", "M365_CLIENT_ID"}
-	values := map[string]string{"M365_TENANT_ID": tenant, "M365_USER_OID": oid, "M365_CLIENT_ID": models.DefaultClientID}
+	values := map[string]string{"M365_TENANT_ID": tenant, "M365_USER_OID": oid, "M365_CLIENT_ID": clientID}
 	original = strings.TrimRight(original, "\r\n")
 	if original == "" {
 		original = "# M365 Copilot Configuration"

@@ -27,10 +27,14 @@ type LoginOptions struct {
 }
 
 func saveEnvTo(tenant, oid, clientID, envFile string) error {
+	existing, err := os.ReadFile(envFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to read existing environment file: %w", err)
+	}
 	if clientID == "" {
 		clientID = models.DefaultClientID
 	}
-	envContent := fmt.Sprintf("# M365 Copilot Configuration\nM365_TENANT_ID=%s\nM365_USER_OID=%s\nM365_CLIENT_ID=%s\n", tenant, oid, clientID)
+	envContent := mergeIdentityEnv(string(existing), tenant, oid, clientID)
 	if err := atomicfile.Write(envFile, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("failed to save environment file: %w", err)
 	}
@@ -49,7 +53,7 @@ func RunLogin(opts LoginOptions) error {
 
 // RunDeviceLogin performs zero-browser sign-in using OAuth2 Device Code Flow (RFC 8628).
 // The user authorizes on any separate device (phone, laptop) and the server acquires
-// a 90-day rolling refresh token directly without any local browser.
+// renewable credentials directly without automating a local browser.
 func RunDeviceLogin(quiet bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -202,7 +206,7 @@ func printNativeSuccess(res *auth.TokenResult) {
 	}
 	fmt.Printf("  Tenant ID: %s\n", res.TenantID)
 	fmt.Printf("  User OID:  %s\n", res.UserOID)
-	fmt.Println("  Refresh token saved with 90-day rolling expiration.")
-	fmt.Println("  Zero browser required: automatic token refresh is now active.")
+	fmt.Println("  Text credentials saved locally. Renewal is available while Microsoft permits it.")
+	fmt.Println("  Designer image authorization is separate; use login-browser if images require sign-in.")
 	fmt.Println()
 }

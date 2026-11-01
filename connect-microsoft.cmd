@@ -1,6 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "m365-bridge-browser-login.exe" goto installed
+set "M365_CONFIG_FROM_INSTALLATION=1"
 if not exist "m365-bridge.exe" call "%~dp0build-m365-bridge.cmd"
 if not exist "m365-bridge.exe" exit /b 1
 
@@ -14,4 +16,8 @@ if errorlevel 1 (
 
 echo Step 2 of 2: starting M365Bridge on http://127.0.0.1:8000
 m365-bridge.exe serve --port 8000
-endlocal
+exit /b %errorlevel%
+
+:installed
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\connect-microsoft.ps1" -InstallRoot "%~dp0."
+exit /b %errorlevel%
