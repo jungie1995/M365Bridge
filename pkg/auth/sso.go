@@ -979,8 +979,7 @@ func followBrokerRedirects(client *http.Client, resp *http.Response, cookieHeade
 		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d", i)
 
 		// The final redirect is brk_redirect_uri, which is on the M365 host.
-		target, parseErr := url.Parse(location)
-		if parseErr == nil && target.Scheme == "https" && target.Host == "m365.cloud.microsoft" && target.User == nil && target.Path == "/spalanding" {
+		if isBrokerLandingRedirect(location) {
 			authCode, codeErr := brokerAuthCodeFromRedirect(location)
 			if codeErr != nil {
 				return "", codeErr
@@ -1005,6 +1004,11 @@ func followBrokerRedirects(client *http.Client, resp *http.Response, cookieHeade
 	}
 
 	return "", fmt.Errorf("broker authorize: max redirects (%d) reached without obtaining auth code", maxRedirects)
+}
+
+func isBrokerLandingRedirect(location string) bool {
+	target, err := url.Parse(location)
+	return err == nil && target.Scheme == "https" && target.Host == "m365.cloud.microsoft" && target.User == nil && target.Path == "/spalanding"
 }
 
 // exchangeBrokerAuthCode exchanges an authorization code for a broker

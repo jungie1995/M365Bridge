@@ -1,9 +1,6 @@
 package browserlogin
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,13 +11,7 @@ func TestCloseWaitsForBrowserAcknowledgement(t *testing.T) {
 	received := make(chan message, 1)
 	acknowledge := make(chan struct{})
 	disconnected := make(chan struct{})
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	b := testBrowserConnection(t, func(conn *websocket.Conn) {
 		var request message
 		if conn.ReadJSON(&request) != nil {
 			return
@@ -30,13 +21,7 @@ func TestCloseWaitsForBrowserAcknowledgement(t *testing.T) {
 		_ = conn.WriteJSON(map[string]any{"id": request.ID, "result": map[string]any{}})
 		_, _, _ = conn.ReadMessage()
 		close(disconnected)
-	}))
-	defer server.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := &browser{conn: conn}
+	})
 	done := make(chan struct{})
 	go func() { b.close(); close(done) }()
 	request := <-received
@@ -64,22 +49,10 @@ func TestCloseWaitsForBrowserAcknowledgement(t *testing.T) {
 }
 
 func TestCloseToleratesBrowserDisconnect(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	b := testBrowserConnection(t, func(conn *websocket.Conn) {
 		var request message
 		_ = conn.ReadJSON(&request)
-	}))
-	defer server.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := &browser{conn: conn}
+	})
 	done := make(chan struct{})
 	go func() { b.close(); close(done) }()
 	select {
@@ -90,24 +63,11 @@ func TestCloseToleratesBrowserDisconnect(t *testing.T) {
 }
 
 func TestCloseIsBoundedWhenBrowserDoesNotRespond(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+	b := testBrowserConnection(t, func(conn *websocket.Conn) {
 		var request message
 		_ = conn.ReadJSON(&request)
 		_, _, _ = conn.ReadMessage()
-	}))
-	defer server.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	b := &browser{conn: conn}
+	})
 	done := make(chan struct{})
 	go func() { b.close(); close(done) }()
 	select {

@@ -103,11 +103,17 @@ func (b *browser) send(method string, params any, session string) (int, error) {
 }
 
 func (b *browser) read(ctx context.Context) (message, error) {
+	if err := ctx.Err(); err != nil {
+		return message{}, err
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = b.conn.SetReadDeadline(deadline)
 	}
 	var event message
 	if err := b.conn.ReadJSON(&event); err != nil {
+		if ctx.Err() != nil {
+			return event, ctx.Err()
+		}
 		return event, errors.New("sign-in was interrupted or timed out; open the sign-in window again")
 	}
 	if event.SessionID == b.session {
@@ -164,6 +170,9 @@ func (b *browser) observeNavigation(params json.RawMessage) {
 }
 
 func (b *browser) call(ctx context.Context, method string, params any, session string) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id, err := b.send(method, params, session)
 	if err != nil {
 		return nil, err
@@ -221,7 +230,7 @@ func Run(parent context.Context, config *models.Config, options Options) (result
 		}
 	}()
 	if (config.TenantID == "") != (config.UserOID == "") {
-		return errors.New("Microsoft account configuration is incomplete; restore both account IDs from this installation's backup before reconnecting")
+		return errors.New("the Microsoft account configuration is incomplete; restore both account IDs from this installation's backup before reconnecting")
 	}
 	if err := writeStatus(options, "starting", "Opening a dedicated Microsoft Edge sign-in window."); err != nil {
 		return errors.New("could not write browser sign-in status")
@@ -268,24 +277,7 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	if err != nil {
 		return err
 	}
-	if firstLogin {
-		err = tm.CompleteBrowserSetup(ctx, challenge, b.callback, login, portal, func(tenant, oid string) error {
-			if err := setup.SaveBrowserIdentity(tenant, oid); err != nil {
-				return err
-			}
-			config.TenantID, config.UserOID = tenant, oid
-			return nil
-		})
-	} else {
-		err = tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal)
-		if err == nil {
-			// Keep subsequent server refreshes on the same client that issued the
-			// browser token instead of leaving the device-code client in .env.
-			config.ClientID = browserClientID
-			err = setup.SaveBrowserIdentity(config.TenantID, config.UserOID)
-		}
-	}
-	if err != nil {
+	if err := b.saveBrowserLogin(ctx, config, tm, challenge, login, portal, firstLogin); err != nil {
 		return err
 	}
 	// A first sign-in discovers the identity. Use that verified identity for the
@@ -297,6 +289,25 @@ func runSignIn(ctx context.Context, config *models.Config, options Options) erro
 	}
 	_ = writeStatus(options, "connected", "Microsoft text and Designer image credentials saved for this account. Automatic renewal is available while Microsoft permits it; reconnect here if interaction is required again.")
 	return nil
+}
+
+func (b *browser) saveBrowserLogin(ctx context.Context, config *models.Config, tm *auth.TokenManager, challenge *auth.BrowserChallenge, login, portal []auth.SSOCookie, firstLogin bool) error {
+	if firstLogin {
+		return tm.CompleteBrowserSetup(ctx, challenge, b.callback, login, portal, func(tenant, oid string) error {
+			if err := setup.SaveBrowserIdentity(tenant, oid); err != nil {
+				return err
+			}
+			config.TenantID, config.UserOID = tenant, oid
+			return nil
+		})
+	}
+	if err := tm.CompleteBrowserLogin(ctx, challenge, b.callback, login, portal); err != nil {
+		return err
+	}
+	// Keep subsequent server refreshes on the same client that issued the
+	// browser token instead of leaving the device-code client in .env.
+	config.ClientID = models.DefaultClientID
+	return setup.SaveBrowserIdentity(config.TenantID, config.UserOID)
 }
 
 func (b *browser) close() {

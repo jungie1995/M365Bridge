@@ -7967,20 +7967,9 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	limitRequestBody(w, r, imageRequestBodyMax)
-	var req imageGenerationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		logging.Errorf("handleImageGenerations: invalid JSON: %v", err)
-		api.sendRequestBodyError(w, err)
+	req, ok := api.parseImageGenerationRequest(w, r)
+	if !ok {
 		return
-	}
-	if req.Prompt == "" {
-		api.sendError(w, http.StatusBadRequest, "prompt is required")
-		return
-	}
-	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s", req.Model, req.N, req.Size, req.ResponseFormat)
-	if req.N <= 0 {
-		req.N = 1
 	}
 
 	// Build prompt with size/quality/style hints appended
@@ -8025,6 +8014,25 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})
+}
+
+func (api *APIServer) parseImageGenerationRequest(w http.ResponseWriter, r *http.Request) (imageGenerationRequest, bool) {
+	limitRequestBody(w, r, imageRequestBodyMax)
+	var req imageGenerationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logging.Errorf("handleImageGenerations: invalid JSON: %v", err)
+		api.sendRequestBodyError(w, err)
+		return req, false
+	}
+	if req.Prompt == "" {
+		api.sendError(w, http.StatusBadRequest, "prompt is required")
+		return req, false
+	}
+	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s", req.Model, req.N, req.Size, req.ResponseFormat)
+	if req.N <= 0 {
+		req.N = 1
+	}
+	return req, true
 }
 
 // handleImageEdits handles OpenAI /v1/images/edits requests.
@@ -8406,16 +8414,6 @@ func (api *APIServer) validateImageDownloadURL(rawURL string) error {
 	return nil
 }
 
-// downloadAndBase64 downloads an image from a designerapp URL and returns its
-// base64-encoded content.
-func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
-	body, _, err := api.downloadImage(imageURL)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(body), nil
-}
-
 // downloadImage downloads an image from a designerapp URL and returns its bytes
 // with the content type the server reported. designerapp URLs require a JWE
 // access token (acquired via SSO cookies with the M365 web app client_id) and
@@ -8510,10 +8508,10 @@ func readDownloadedImage(resp *http.Response) ([]byte, string, error) {
 	// Never relabel an HTML login/error page as PNG, even with HTTP 200.
 	config, format, err := image.DecodeConfig(bytes.NewReader(body))
 	if err != nil || config.Width < 1 || config.Height < 1 || int64(config.Width)*int64(config.Height) > 40_000_000 {
-		return nil, "", errors.New("Microsoft image response was not a supported raster within safe dimensions")
+		return nil, "", errors.New("the Microsoft image response was not a supported raster within safe dimensions")
 	}
 	if _, _, err := image.Decode(bytes.NewReader(body)); err != nil {
-		return nil, "", errors.New("Microsoft image response was incomplete or corrupt")
+		return nil, "", errors.New("the Microsoft image response was incomplete or corrupt")
 	}
 	contentType := "image/" + format
 
